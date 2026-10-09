@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>NMR Relaxation Database</title>
+<meta name="description" content="Measured and simulated NMR T2 and diffusion data for pure liquids and binary mixtures, stored in SQLite.">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23ffffff'/%3E%3Ctext x='32' y='43' font-family='Georgia,serif' font-size='30' font-weight='700' text-anchor='middle' fill='%231a2540'%3ET2%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container">
+    <div class="header-row">
+      <a class="brand" href="#overview"><span class="brand-mark">T₂</span><span class="brand-name">NMR Relaxation Database</span></a>
+      <span class="spacer"></span>
+      <span class="status" id="status" aria-live="polite">Starting…</span>
+      <div class="header-actions" id="header-actions"></div>
+    </div>
+    <nav class="site-nav" id="nav" aria-label="Sections"></nav>
+  </div>
+</header>
+<div class="container" id="banners"></div>
+<main id="main" class="container"><div class="boot">Loading the SQLite engine…</div></main>
+<div id="overlay"></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<input type="file" id="open-db-input" accept=".sqlite,.sqlite3,.db,application/vnd.sqlite3,application/x-sqlite3" hidden>
+
+<script src="lib/sql-wasm.js"></script>
+<script src="lib/papaparse.min.js"></script>
+<script src="lib/read-excel-file.min.js"></script>
+<script src="lib/schema.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
