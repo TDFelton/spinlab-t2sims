@@ -23,11 +23,8 @@ opens in Python, R or DB Browser for SQLite.
 
 **Privacy.** GitHub Pages sites are public on the internet, even when the
 repository is private, unless the repository belongs to an organization on
-GitHub Enterprise Cloud. On GitHub Free, Pages only works from public
-repositories, so everything committed is public twice over. If the data should
-stay private until publication, publish only the site and keep
-`database.sqlite` somewhere private (lab drive, private repo, OneDrive); people
-then use **Open a .sqlite file…** on the Export page to load it. Opening a local file never uploads it.
+GitHub Enterprise Cloud. The site itself holds no data, so that's fine. Keep
+the database in the lab's shared folder (below), not in the repository.
 
 ### Run it without GitHub
 
@@ -44,23 +41,59 @@ then use **Open a .sqlite file…** on the Export page to load it. Opening a loc
 
 | Place | What it is | Who sees it |
 |---|---|---|
+| **`master.sqlite` in the lab's shared folder** | The shared master copy | Whoever the folder is shared with |
 | **This browser** (IndexedDB) | Your working copy, saved after every change | Only you, in this browser |
-| **`database.sqlite` you download** | A snapshot of the whole database | Whoever you give it to |
-| **`data/database.sqlite` in the repo** | The shared copy everyone starts from | Everyone who opens the site |
+| **A `.sqlite` you download** | A snapshot of the whole database | Whoever you give it to |
 
-To share changes: **Download .sqlite**, replace `data/database.sqlite` in the
-repository with it (GitHub's *Add file → Upload files* works), and commit.
-When someone opens the site and the repository file is newer than what their
-browser started from, they get a notice offering to load it.
+### Set up the master file (once)
 
-**Limits to know about**
+1. Pick a folder the lab already shares through OneDrive, Google Drive or
+   Box, and make sure it syncs to your computer (the desktop sync app).
+2. Open the site in **Chrome or Edge**, go to **Export**, and click
+   **Create master file…**. Save it into that folder as `master.sqlite`. This
+   starts the master from whatever is in your browser.
+3. Everyone else: **Export → Open master file…** and pick `master.sqlite` in
+   their synced copy of the folder.
 
-* Two people editing at the same time each have their own working copy. The
-  last file committed wins; nothing merges automatically. Agree on who
-  commits, or move rows between copies with CSV export and import.
-* Clearing browser data deletes the working copy. Download often; the status
-  line at the top says when you have changes that haven't been downloaded.
+### Day to day
+
+* Open the site. If the browser asks, click **Open latest** (or choose
+  "Allow on every visit" in Chrome's prompt so it loads automatically).
+* Edit as usual, then click **Save to master** (or press Ctrl+S). The status
+  line at the top says when you have changes that aren't saved to it.
+* The sync app uploads the file; labmates get your changes the next time they
+  open the site or switch back to its tab.
+
+### When two people edit at once
+
+The site remembers a fingerprint (SHA-256) of the master each time it loads or
+saves it. If someone else saved in between, **Save to master** stops and
+offers to download your version and load theirs, or to overwrite theirs. It
+never overwrites silently. Nothing merges automatically: to combine both sets
+of changes, re-enter yours, or export them as CSV from your downloaded copy and
+import that into the master (the importer skips rows that already exist).
+If a bad save ever slips through, roll back from the drive's version history:
+OneDrive and Google Drive keep earlier versions for about 30 days, and Box
+keeps a number of versions that depends on the plan.
+
+### Other browsers
+
+Saving straight to a file uses the File System Access API, which Chrome and
+Edge support but Firefox and Safari don't (Brave only behind a flag). In those
+browsers: **Export → Open a .sqlite file…** to load `master.sqlite`, edit,
+then **Download .sqlite** and replace `master.sqlite` in the shared folder
+with it, keeping the name.
+
+**Also good to know**
+
+* The browser shows the file's name but never its folder, and it only gets
+  access to the one file you pick.
+* Clearing browser data removes the working copy and the remembered link; the
+  master file isn't affected. Link it again with **Open master file…**.
 * Undo keeps the last 30 changes while the tab is open.
+* The old route still works if you ever want a public copy: a
+  `data/database.sqlite` committed to the repository is offered to visitors
+  who aren't linked to a master.
 
 ---
 
@@ -168,8 +201,26 @@ problem with its spreadsheet row number).
 * **Units in headers are converted**: `T2 (ms)`, `Temp [°C]`, `D (cm^2/s)`,
   `D (nm^2/ns)`, `D (Å^2/ps)`, `D (1e-9 m^2/s)`, `t2_ms`. You can override the
   unit for each column.
-* **Compounds** are found by name or CAS number; missing ones can be created
-  automatically.
+* **Compounds are recognised by CAS number, then SMILES, then name**, using
+  whichever of those columns you map. This applies when importing compounds
+  and wherever an experiment, simulation or result names a compound. Names
+  already in the database are never changed by an import, so a file can call
+  1,4-dioxane `1-4-dioxane` and still update the right row.
+  * CAS numbers are matched after trimming spaces and leading zeros, and the
+    preview flags any whose check digit is wrong.
+  * SMILES are matched as exact text, because the same molecule can be written
+    several ways (`C1COCCO1` and `O1CCOCC1` are both 1,4-dioxane). Matching
+    works when both sides come from the same source, such as PubChem.
+  * If a row's CAS disagrees with the CAS stored for the compound its SMILES
+    or name points to, the row is flagged instead of imported.
+  * Compound imports have two settings: what to do with compounds already in
+    the database (leave them, or fill in values from the file's non-blank
+    cells) and with compounds that aren't (add them using the file's name or
+    their CAS number, or skip them). Every new compound needs a name, so a
+    row without one is named by its CAS number, or by its SMILES if it has no
+    CAS; rename it later in Physical constants.
+  * Experiment, simulation and result imports can create missing compounds
+    automatically.
 * **Results from your scripts** can be long (columns `quantity`, `value`,
   `contribution`, `species`, `method`, optional `unit`) or wide (one row per
   simulation with columns like `T2_intra`, `T2_inter`, `T2_total`,
