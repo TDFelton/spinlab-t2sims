@@ -6,15 +6,18 @@
      (SQLite compiled to WebAssembly). schema.sql defines the tables.
    * After every change the database is saved to this browser
      (IndexedDB), so a reload keeps your work.
-   * "Download .sqlite" gives you database.sqlite. Commit that file to
-     data/database.sqlite in the GitHub repository to share it: anyone
-     who opens the site then starts from that version.
+   * The lab's shared copy is a master .sqlite file kept in a synced
+     folder (OneDrive, Google Drive, Box). In Chrome and Edge the site
+     opens that file and saves straight back to it (File System Access
+     API); other browsers open it and download a replacement.
+   * Optionally, a copy committed to data/database.sqlite in the repo is
+     offered to visitors (public, so only for data that may be public).
    * No build step: plain HTML, CSS and JavaScript.
    ===================================================================== */
 (function () {
   'use strict';
 
-  const SCHEMA_VERSION = 1;
+  const SCHEMA_VERSION = 3;
   const REPO_DB_PATH = 'data/database.sqlite';
   const IDB_NAME = 'nmr-relaxation-db';
   const ROW_LIMIT = 100;
@@ -136,6 +139,9 @@
     source: 'new',           // 'browser' | 'repo' | 'file' | 'new'
     repoHash: null,          // hash of the repository file this working copy started from
     repoNotice: null,        // {bytes, hash} when the repository file differs
+    repoAvailable: false,    // a data/database.sqlite exists in the site
+    master: null,            // {handle, name, hash, syncedAt, ready}: linked master file
+    masterNotice: null,      // 'permission' | 'missing' | 'changed'
     currentBytes: null,
     undo: [],
     real: null,              // the real database while example mode is on
@@ -183,9 +189,72 @@
       state.db.exec(window.NMRDB_SCHEMA);
       return { created: true };
     }
-    const v = Number(metaGet('schema_version') || 0);
+    const v = Number(metaGet('schema_version') || 1);
     if (v > SCHEMA_VERSION) return { newer: true, version: v };
+    if (v < SCHEMA_VERSION) {
+      try { migrate(v); return { ok: true, migrated: v }; }
+      catch (e) { console.error('Upgrade failed', e); return { ok: true, migrateError: e }; }
+    }
     return { ok: true };
+  }
+
+  /**
+   * Upgrades for databases made by older versions of the site. Each runs
+   * inside one transaction with the others; if anything fails, nothing changes.
+   * Views and triggers are dropped and rebuilt from schema.sql.
+   */
+  const MIGRATIONS = {
+    // 1 -> 2: CAS number, SMILES and name all identify a compound; the name becomes optional.
+    // SQLite can't drop NOT NULL from a column, so the compounds table is rebuilt with the same ids.
+    1: () => {
+      for (const r of q("SELECT type, name FROM sqlite_master WHERE type IN ('view', 'trigger')")) run(`DROP ${r.type.toUpperCase()} IF EXISTS "${r.name.replace(/"/g, '""')}"`);
+      run('ALTER TABLE compounds RENAME TO compounds_v1');
+      state.db.exec(window.NMRDB_SCHEMA);
+      run('DROP TRIGGER IF EXISTS compounds_smiles_unique_ins'); // older files may already hold repeated SMILES
+      run(`INSERT INTO compounds (compound_id, cas, smiles, name, formula, mw_g_mol, density_g_cm3, hsp_d_mpa05, hsp_p_mpa05, hsp_h_mpa05, source, comments, created_at, updated_at)
+           SELECT compound_id, NULLIF(trim(cas), ''), NULLIF(trim(smiles), ''), NULLIF(trim(name), ''), formula, mw_g_mol, density_g_cm3,
+                  hsp_d_mpa05, hsp_p_mpa05, hsp_h_mpa05, source, comments, created_at, updated_at FROM compounds_v1`);
+      run('DROP TABLE compounds_v1');
+      state.db.exec(window.NMRDB_SCHEMA); // restores the SMILES trigger for new rows
+    },
+    // 2 -> 3: compounds get other_names (alternative names that imports recognise). Adding a column
+    // keeps every row and id as it is. A file coming from version 1 already has it (step 1 builds the table).
+    2: () => {
+      if (!q('PRAGMA table_info(compounds)').some(c => c.name === 'other_names')) run('ALTER TABLE compounds ADD COLUMN other_names TEXT');
+      for (const r of q("SELECT name FROM sqlite_master WHERE type = 'view'")) run(`DROP VIEW IF EXISTS "${r.name.replace(/"/g, '""')}"`);
+      state.db.exec(window.NMRDB_SCHEMA); // views again, so v_compounds includes the new column
+    },
+  };
+  const MIGRATION_NOTES = {
+    1: 'compounds are identified by CAS number, SMILES or name, and the name is optional',
+    2: 'compounds can list other names, which imports recognise like the name',
+  };
+  function migrate(from) {
+    // Foreign keys off and legacy rename on, so renaming compounds doesn't repoint the other tables' links.
+    state.db.run('PRAGMA foreign_keys = OFF');
+    state.db.run('PRAGMA legacy_alter_table = ON');
+    run('BEGIN');
+    try {
+      for (let v = from; v < SCHEMA_VERSION; v++) MIGRATIONS[v]();
+      metaSet('schema_version', SCHEMA_VERSION);
+      metaSet('upgraded_at', nowIso());
+      const broken = q('PRAGMA foreign_key_check');
+      if (broken.length) throw new Error(`${broken.length} links between records would break`);
+      run('COMMIT');
+    } catch (e) {
+      try { run('ROLLBACK'); } catch (_) { /* nothing open */ }
+      throw e;
+    } finally {
+      state.db.run('PRAGMA legacy_alter_table = OFF');
+      state.db.run('PRAGMA foreign_keys = ON');
+    }
+  }
+  function schemaNotice(s) {
+    if (s.migrated) {
+      const notes = []; for (let v = s.migrated; v < SCHEMA_VERSION; v++) notes.push(MIGRATION_NOTES[v]);
+      toast(`Upgraded this database to version ${SCHEMA_VERSION}: ${notes.join('; ')}. The file itself is updated the next time you save.`);
+    }
+    if (s.migrateError) toast(`This database couldn't be upgraded (${s.migrateError.message}). Nothing in it was changed.`, { err: true });
   }
 
   const isSqlite = b => b && b.length >= 16 && String.fromCharCode.apply(null, b.slice(0, 15)) === 'SQLite format 3';
@@ -231,7 +300,8 @@
     const s = state.undo.pop();
     if (!s) return;
     openDb(s.bytes);
-    state.currentBytes = s.bytes;
+    ensureSchema();
+    state.currentBytes = exportBytes();
     state.dirty = true;
     schedulePersist();
     closeDrawer();
@@ -244,6 +314,8 @@
     const m = String(e && e.message || e);
     if (/UNIQUE constraint failed: compounds\.name/.test(m)) return 'A compound with this name already exists.';
     if (/UNIQUE constraint failed: compounds\.cas/.test(m)) return 'Another compound already has this CAS number.';
+    if (/Another compound already has this SMILES/.test(m)) return 'Another compound already has this SMILES.';
+    if (/smiles IS NOT NULL OR name IS NOT NULL/.test(m)) return 'A compound needs at least one of CAS number, SMILES or name.';
     if (/UNIQUE constraint failed: quantities\.quantity/.test(m)) return 'That quantity already exists.';
     if (/FOREIGN KEY constraint failed/.test(m)) return 'This change would break a link between records (for example, deleting something other records still use).';
     if (/CHECK constraint failed/.test(m)) return `A value is outside its allowed range. SQLite reported: ${m.replace(/^.*CHECK constraint failed:\s*/, '')}`;
@@ -279,6 +351,15 @@
     return new Promise((resolve, reject) => {
       const tx = d.transaction('kv', 'readwrite');
       tx.objectStore('kv').put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+  async function idbDelete(key) {
+    const d = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = d.transaction('kv', 'readwrite');
+      tx.objectStore('kv').delete(key);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
@@ -352,7 +433,26 @@
   /* ------------------------------------------------------------------ *
    *  Lookups used by forms and tables
    * ------------------------------------------------------------------ */
-  const compoundsList = () => q('SELECT compound_id, name, cas FROM compounds ORDER BY name COLLATE NOCASE');
+  /** How a compound is shown: its name, else its CAS number, else its SMILES. */
+  const compoundLabel = c => (c && (c.name || c.cas || c.smiles)) || '(no identifier)';
+  /** Other names are stored as one text, separated by semicolons (chemical names often contain commas). */
+  const splitNames = t => String(t ?? '').split(';').map(x => x.trim()).filter(Boolean);
+  /** Joins names, dropping repeats (ignoring case) and any in `except`; null when nothing is left. */
+  function joinNames(names, except = []) {
+    const seen = new Set(except.filter(Boolean).map(x => x.toLowerCase())), out = [];
+    for (const n of names) { const k = n.toLowerCase(); if (!seen.has(k)) { seen.add(k); out.push(n); } }
+    return out.length ? out.join('; ') : null;
+  }
+  /** Who already uses this name, as a name or an other name? Returns that compound, or null. */
+  function nameOwner(name, exceptId) {
+    const k = String(name).trim().toLowerCase();
+    for (const c of q('SELECT compound_id, name, cas, smiles, other_names FROM compounds')) {
+      if (c.compound_id === exceptId) continue;
+      if ((c.name && c.name.toLowerCase() === k) || splitNames(c.other_names).some(n => n.toLowerCase() === k)) return c;
+    }
+    return null;
+  }
+  const compoundsList = () => q('SELECT compound_id, name, cas, smiles FROM compounds ORDER BY coalesce(name, cas, smiles) COLLATE NOCASE');
   const quantitiesList = () => q('SELECT quantity, unit, description FROM quantities ORDER BY quantity');
   const distinct = (table, col) => q(`SELECT DISTINCT ${col} AS v FROM ${table} WHERE ${col} IS NOT NULL AND trim(${col}) <> '' ORDER BY 1 COLLATE NOCASE LIMIT 200`).map(r => r.v);
 
@@ -400,13 +500,14 @@
 
   const FORMS = {
     compounds: {
-      noun: 'compound', title: r => r.name, table: 'compounds', pk: 'compound_id',
+      noun: 'compound', title: r => compoundLabel(r), table: 'compounds', pk: 'compound_id',
       sections: [
-        { title: 'Identity', fields: [
-          { key: 'name', label: 'Name', type: 'text', required: true, full: true },
-          { key: 'cas', label: 'CAS number', type: 'text', placeholder: 'e.g. 108-88-3' },
+        { title: 'Identifiers: CAS, then SMILES, then name', fields: [
+          { key: 'cas', label: 'CAS number', type: 'text', placeholder: 'e.g. 108-88-3', hint: 'Checked against its check digit.' },
+          { key: 'smiles', label: 'SMILES', type: 'text', mono: true, placeholder: 'e.g. Cc1ccccc1' },
+          { key: 'name', label: 'Name', type: 'text', placeholder: 'e.g. Toluene', hint: 'A compound needs at least one of the three; each must be unique.' },
           { key: 'formula', label: 'Formula', type: 'text', placeholder: 'e.g. C7H8' },
-          { key: 'smiles', label: 'SMILES', type: 'text', full: true, mono: true },
+          { key: 'other_names', label: 'Other names', type: 'text', full: true, placeholder: 'e.g. methylbenzene; toluol', hint: 'Separated by semicolons. Imports recognise these like the name.' },
         ] },
         { title: 'Physical constants', fields: [
           { key: 'mw_g_mol', label: 'Molar mass', type: 'number', unit: 'g/mol' },
@@ -573,26 +674,44 @@
   function renderStatus() {
     const el = $('#status');
     if (!el || !state.db) return;
+    const m = state.master;
     let html;
     if (state.mode === 'example') html = 'Example data. Nothing here is saved.';
-    else if (!state.persistOk) html = '<strong>Not saved.</strong> This browser is blocking storage, so download before closing.';
-    else if (state.dirty) html = 'Saved in this browser. <strong>Not downloaded since the last change.</strong>';
-    else html = state.source === 'repo' ? 'Saved in this browser. Same as the repository file.' : 'Saved in this browser. Matches your last download.';
+    else if (!state.persistOk) html = '<strong>Not saved.</strong> This browser is blocking storage, so save to a file before closing.';
+    else if (m && state.dirty) html = `<strong>Changes not saved to ${esc(m.name)}.</strong>`;
+    else if (m && !m.ready) html = `Linked to ${esc(m.name)}.`;
+    else if (m) html = `Saved to ${esc(m.name)}${m.syncedAt ? ` · ${esc(fmtTime(m.syncedAt))}` : ''}.`;
+    else if (state.dirty) html = 'Saved in this browser. <strong>Not saved to a file since the last change.</strong>';
+    else html = state.source === 'repo' ? 'Saved in this browser. Same as the repository file.' : 'Saved in this browser.';
     el.classList.toggle('off', state.mode !== 'example' && !state.persistOk);
     el.innerHTML = html;
     const last = state.undo[state.undo.length - 1];
+    const save = m
+      ? `<button class="btn ${state.dirty ? 'primary' : ''}" data-action="master-save" title="Ctrl+S">Save to master</button>`
+      : `<button class="btn ${state.dirty ? 'primary' : ''}" data-action="download-sqlite">Download .sqlite</button>`;
     $('#header-actions').innerHTML = state.mode === 'example'
       ? '<button class="btn primary" data-action="exit-example">Leave example data</button>'
-      : `<button class="btn ghost" data-action="undo" ${last ? `title="Undo: ${esc(last.label)}"` : 'disabled'}>Undo</button>
-         <button class="btn ${state.dirty ? 'primary' : ''}" data-action="download-sqlite">Download .sqlite</button>`;
+      : `<button class="btn ghost" data-action="undo" ${last ? `title="Undo: ${esc(last.label)}"` : 'disabled'}>Undo</button>${save}`;
   }
+  const fmtTime = iso => { try { const d = new Date(iso); return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); } catch (_) { return iso; } };
 
   function renderBanners() {
     const parts = [];
     if (state.mode === 'example') {
       parts.push(`<div class="banner"><span class="badge">Example data</span><div class="grow">The measurements and simulation results here are made up; the constants list their sources. Your own database comes back when you leave.</div></div>`);
     }
-    if (state.repoNotice && state.mode !== 'example') {
+    const mn = state.master && state.mode !== 'example' ? state.masterNotice : null;
+    if (mn === 'permission') {
+      parts.push(`<div class="banner"><div class="grow">This browser is linked to <strong>${esc(state.master.name)}</strong> in your shared folder. Open the latest copy to see what others saved.</div>
+        <button class="btn sm primary" data-action="master-reload">Open latest</button><button class="btn sm ghost" data-action="master-unlink">Unlink</button></div>`);
+    } else if (mn === 'missing') {
+      parts.push(`<div class="banner bad"><div class="grow"><strong>${esc(state.master.name)}</strong> can't be found. It may have been moved or renamed.</div>
+        <button class="btn sm primary" data-action="master-open">Find the master file…</button><button class="btn sm ghost" data-action="master-unlink">Unlink</button></div>`);
+    } else if (mn === 'changed') {
+      parts.push(`<div class="banner"><div class="grow">Someone saved a newer <strong>${esc(state.master.name)}</strong>.${state.dirty ? ' You also have changes here that aren\'t saved to it.' : ''}</div>
+        <button class="btn sm primary" data-action="master-reload">${state.dirty ? 'Review' : 'Load it'}</button></div>`);
+    }
+    if (state.repoNotice && state.mode !== 'example' && !state.master) {
       parts.push(`<div class="banner"><div class="grow">The repository has a different database file from the one your browser copy started from.</div>
         <button class="btn sm primary" data-action="load-repo">Load the repository version</button>
         <button class="btn sm ghost" data-action="dismiss-repo">Keep mine</button></div>`);
@@ -697,7 +816,7 @@
           <h1 class="display">NMR Relaxation Database</h1>
           <p class="lede">Measured and simulated T₂ and diffusion data for pure liquids and binary mixtures, kept in one SQLite file.</p>
           <p class="meta">SQLite ${esc(q1('SELECT sqlite_version() AS v').v)} · schema v${esc(metaGet('schema_version') ?? '?')}${metaGet('modified_at') ? ` · last change ${esc(metaGet('modified_at').slice(0, 10))}` : ''}</p>
-          <div class="hero-cta"><a class="btn primary" href="#import">Import a file</a>${state.mode === 'normal' ? '<button class="btn" data-action="enter-example">Try example data</button>' : ''}</div>
+          <div class="hero-cta">${fsSupported && !state.master && state.mode === 'normal' ? '<button class="btn primary" data-action="master-open">Open master file</button>' : '<a class="btn primary" href="#import">Import a file</a>'}${state.mode === 'normal' ? '<button class="btn" data-action="enter-example">Try example data</button>' : ''}</div>
         </div>
         <aside class="hero-card corner" aria-label="What is in the database">
           <dl class="quick-facts">
@@ -713,10 +832,10 @@
       <section class="band"><div class="labelled">
         <div><p class="section-num">Sharing</p><h2>Saving and sharing</h2></div>
         <div><ol class="steps-list">
-            <li><span><strong>Changes save in this browser</strong> as you make them. Nobody else sees them yet.</span></li>
-            <li><span><strong>Download .sqlite</strong> to keep a copy. That one file is the whole database.</span></li>
-            <li><span><strong>To share,</strong> commit it to <span class="mono">${REPO_DB_PATH}</span> in the GitHub repository. Everyone who opens the site starts from that version.</span></li></ol>
-          <p class="note" style="margin-top:16px">GitHub Pages sites are public, even from a private repository, unless the repository belongs to a GitHub Enterprise Cloud organization. To keep data private, don't commit it; open a privately stored copy from the <a href="#settings">Export</a> page instead.</p></div>
+            <li><span><strong>Keep master.sqlite in the lab's shared folder</strong> (OneDrive, Google Drive or Box) that syncs to your computer.</span></li>
+            <li><span><strong>Open it here once</strong> with Open master file. This browser remembers it.</span></li>
+            <li><span><strong>Edit, then Save to master.</strong> The sync app uploads the file, and others get your changes the next time they open the site.</span></li></ol>
+          <p class="note" style="margin-top:16px">Saving straight to the file works in Chrome and Edge. In other browsers, open the file from the Export page and download a replacement. The site warns you if someone else saved the master after you opened it. Keep the database out of the GitHub repository: the site is public, the shared folder isn't.</p></div>
       </div></section>
       <section class="labelled" style="padding-top:28px">
         <div><p class="section-num">${empty ? 'Start' : 'Latest'}</p><h2>${empty ? 'Getting started' : 'Recently added'}</h2></div>
@@ -732,19 +851,20 @@
 
   function secConstants(main) {
     const tab = getTab('constants', 'pure');
-    const comps = q('SELECT * FROM v_compounds ORDER BY name COLLATE NOCASE');
+    const comps = q('SELECT * FROM v_compounds ORDER BY label COLLATE NOCASE');
     const mixes = q('SELECT * FROM v_mixture_hsp ORDER BY compound_a, compound_b, x_a');
     const tabs = [{ id: 'pure', label: 'Pure compounds', n: comps.length }, { id: 'mixture', label: 'Mixtures (computed)', n: mixes.length }];
     if (tab === 'pure') {
       main.innerHTML = listSection({ id: 'compounds', eyebrow: 'Data', title: 'Physical constants', tab, tabs, csv: true,
-        desc: 'One row per pure compound, with Hansen parameters (δD dispersion, δP polarity, δH hydrogen bonding) in MPa½.',
-        actions: '<button class="btn primary" data-action="add" data-table="compounds">Add compound</button>' });
+        desc: 'One row per pure compound, identified by CAS number, then SMILES, then name, with Hansen parameters (δD dispersion, δP polarity, δH hydrogen bonding) in MPa½.',
+        actions: '<button class="btn primary" data-action="add" data-table="compounds">Add compound</button><button class="btn" data-action="find-duplicates">Find duplicates</button>' });
       mountTable('compounds', {
         id: 'compounds', rows: comps, rowAction: r => openRowAttr('compounds', r.compound_id),
         empty: emptyState('No compounds yet', 'Experiments and simulations pick their compounds from this list, so this is the place to start.', '<button class="btn primary" data-action="add" data-table="compounds">Add compound</button><a class="btn" href="#import">Import a list</a>'),
         cols: [
-          { key: 'name', label: 'Name', render: r => `<span class="sample">${esc(r.name)}</span>` },
-          { key: 'cas', label: 'CAS', cls: 'mono' },
+          { key: 'cas', label: 'CAS', cls: 'mono', render: r => r.cas ? esc(r.cas) : '<span class="muted">—</span>' },
+          { key: 'smiles', label: 'SMILES', cls: 'mono path', render: r => r.smiles ? esc(r.smiles) : '<span class="muted">—</span>' },
+          { key: 'name', label: 'Name', render: r => (r.name ? `<span class="sample">${esc(r.name)}</span>` : '<span class="muted">—</span>') + (r.other_names ? `<div class="sub-note">also ${esc(splitNames(r.other_names).join(' · '))}</div>` : '') },
           { key: 'formula', label: 'Formula' },
           { key: 'mw_g_mol', label: 'M', unit: 'g mol⁻¹', cls: 'n', render: r => numCell(r.mw_g_mol) },
           { key: 'density_g_cm3', label: 'ρ', unit: 'g cm⁻³', cls: 'n', render: r => numCell(r.density_g_cm3) },
@@ -756,7 +876,7 @@
           { key: 'source', label: 'Source', cls: 'wrap' },
           { key: 'comments', label: 'Comments', cls: 'wrap' },
         ],
-        csvCols: ['compound_id', 'name', 'cas', 'formula', 'smiles', 'mw_g_mol', 'density_g_cm3', 'molar_volume_cm3_mol', 'hsp_d_mpa05', 'hsp_p_mpa05', 'hsp_h_mpa05', 'hsp_total_mpa05', 'source', 'comments'],
+        csvCols: ['compound_id', 'cas', 'smiles', 'name', 'other_names', 'formula', 'mw_g_mol', 'density_g_cm3', 'molar_volume_cm3_mol', 'hsp_d_mpa05', 'hsp_p_mpa05', 'hsp_h_mpa05', 'hsp_total_mpa05', 'source', 'comments'],
       });
     } else {
       main.innerHTML = listSection({ id: 'mixhsp', eyebrow: 'Data', title: 'Physical constants', tab, tabs, csv: true,
@@ -1083,7 +1203,7 @@
   function compoundOptions(selected, allowNone) {
     const list = compoundsList();
     return (allowNone ? '<option value="">— choose —</option>' : '<option value="">— choose a compound —</option>') +
-      list.map(c => `<option value="${c.compound_id}" ${Number(selected) === c.compound_id ? 'selected' : ''}>${esc(c.name)}${c.cas ? ` (${esc(c.cas)})` : ''}</option>`).join('') +
+      list.map(c => `<option value="${c.compound_id}" ${Number(selected) === c.compound_id ? 'selected' : ''}>${esc(compoundLabel(c))}${c.name && c.cas ? ` (${esc(c.cas)})` : ''}</option>`).join('') +
       '<option value="__new">＋ New compound…</option>';
   }
 
@@ -1133,7 +1253,7 @@
             <div class="field" data-field="compound_a_id"><label for="f_compound_a_id"><span data-mix-label>${isMix ? 'Compound A' : 'Compound'}</span> <span class="req">*</span></label><select id="f_compound_a_id" data-key="compound_a_id" data-compound>${compoundOptions(vals.compound_a_id)}</select><div class="err" hidden></div></div>
             <div class="field" data-field="compound_b_id" ${isMix ? '' : 'hidden'}><label for="f_compound_b_id">Compound B <span class="req">*</span></label><select id="f_compound_b_id" data-key="compound_b_id" data-compound>${compoundOptions(vals.compound_b_id)}</select><div class="err" hidden></div></div>
           </div>
-          <div class="inline-new" id="new-compound-row" hidden><input type="text" id="new-compound-name" placeholder="New compound name" aria-label="New compound name"><button type="button" class="btn" data-action="create-compound">Add</button><button type="button" class="linkish" data-action="cancel-compound">Cancel</button></div>
+          <div class="inline-new" id="new-compound-row" style="flex-wrap:wrap" hidden><input type="text" id="new-compound-cas" placeholder="CAS number" aria-label="New compound CAS number" style="flex:1 1 120px"><input type="text" id="new-compound-smiles" class="mono" placeholder="SMILES" aria-label="New compound SMILES" style="flex:1 1 140px"><input type="text" id="new-compound-name" placeholder="Name" aria-label="New compound name" style="flex:1 1 140px"><button type="button" class="btn" data-action="create-compound">Add</button><button type="button" class="linkish" data-action="cancel-compound">Cancel</button></div>
           <div class="field" data-field="x_a" ${isMix ? '' : 'hidden'}><label for="f_x_a">Mole fraction of A, x<sub>A</sub> <span class="req">*</span></label>
             <div class="xa-row"><input type="range" min="0" max="1" step="0.01" id="f_x_a_range" value="${esc(vals.x_a ?? 0.5)}" aria-label="Mole fraction slider"><input type="text" inputmode="decimal" id="f_x_a" data-key="x_a" value="${esc(vals.x_a ?? '')}"></div>
             <div class="xa-read" id="xb-read">${xbText(vals.x_a)}</div><div class="err" hidden></div></div>
@@ -1188,8 +1308,9 @@
         <div><button type="button" class="btn sm" data-action="add-result-for-sim" data-id="${drawer.id}">Add result for this simulation</button></div></div>`;
     }
     if (drawer.table === 'compounds' && drawer.mode === 'edit') {
-      const u = q1('SELECT (SELECT count(*) FROM experiments WHERE ? IN (compound_a_id, compound_b_id)) AS e, (SELECT count(*) FROM simulations WHERE ? IN (compound_a_id, compound_b_id)) AS s', [drawer.id, drawer.id]);
-      extra = `<div class="form-sec"><div class="form-sec-title">Used by</div><p style="margin:0" class="muted">${plural(u.e, 'experiment')} · ${plural(u.s, 'simulation')}</p></div>`;
+      const u = compoundUsage(drawer.id);
+      extra = `<div class="form-sec"><div class="form-sec-title">Used by</div><p style="margin:0" class="muted">${plural(u.e, 'experiment')} · ${plural(u.s, 'simulation')} · ${plural(u.p, 'processed result')} as a species</p>
+        <div><button type="button" class="btn sm" data-action="merge-from" data-id="${drawer.id}">Merge with another compound…</button></div></div>`;
     }
     const lockedName = drawer.table === 'quantities' && drawer.mode === 'edit' && BUILTIN_QUANTITIES.includes(drawer.id);
     const usedQty = drawer.table === 'quantities' && drawer.mode === 'edit' ? q1('SELECT count(*) AS n FROM processed_results WHERE quantity = ?', [drawer.id]).n : 0;
@@ -1238,10 +1359,9 @@
       xa.addEventListener('input', () => { const n = parseNum(xa.value); if (Number.isFinite(n)) range.value = n; $('#xb-read').innerHTML = xbText(xa.value); });
     }
     $$('select[data-compound]', form).forEach(s => s.addEventListener('change', () => {
-      if (s.value === '__new') { pendingCompoundSelect = s; $('#new-compound-row').hidden = false; $('#new-compound-name').focus(); }
+      if (s.value === '__new') { pendingCompoundSelect = s; $('#new-compound-row').hidden = false; $('#new-compound-cas').focus(); }
     }));
-    const nc = $('#new-compound-name');
-    if (nc) nc.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); createCompoundInline(); } });
+    $$('#new-compound-row input', form).forEach(i => i.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); createCompoundInline(); } }));
     const simSel = $('#f_simulation_id');
     if (simSel && $('#f_species_compound_id')) simSel.addEventListener('change', () => { $('#f_species_compound_id').innerHTML = speciesOptions(simSel.value, null); });
     const qtySel = $('#f_quantity');
@@ -1257,16 +1377,208 @@
   }
 
   function createCompoundInline() {
-    const name = $('#new-compound-name').value.trim();
-    if (!name) return;
+    const cas = normCas($('#new-compound-cas').value);
+    const smiles = $('#new-compound-smiles').value.trim() || null;
+    const name = $('#new-compound-name').value.trim() || null;
+    if (!cas && !smiles && !name) { toast('Give a CAS number, SMILES or name.', { err: true }); return; }
+    if (cas && !casCheckOk(cas)) { toast(`${cas} isn't a valid CAS number. They look like 71-43-2, and the last digit is a check digit.`, { err: true }); return; }
+    const owner = name && nameOwner(name, null);
+    if (owner && !(owner.name && owner.name.toLowerCase() === name.toLowerCase())) { toast(`"${name}" is another name of ${compoundLabel(owner)}; choose that compound instead.`, { err: true }); return; }
+    const label = compoundLabel({ name, cas, smiles });
     try {
-      const id = mutate(`Add compound ${name}`, () => { run('INSERT INTO compounds (name) VALUES (?)', [name]); return lastId(); });
+      const id = mutate(`Add compound ${label}`, () => { run('INSERT INTO compounds (cas, smiles, name) VALUES (?, ?, ?)', [cas, smiles, name]); return lastId(); });
       // mutate() re-rendered the page but the drawer markup lives in #overlay, so refresh the selects in place.
       $$('select[data-compound]').forEach(s => { const keep = s === pendingCompoundSelect ? id : s.value; s.innerHTML = compoundOptions(keep); });
       $('#new-compound-row').hidden = true;
-      $('#new-compound-name').value = '';
-      toast(`Added ${name}. Fill in its constants later in Physical constants.`);
+      $$('#new-compound-row input').forEach(i => { i.value = ''; });
+      toast(`Added ${label}. Fill in its constants later in Physical constants.`);
     } catch (e) { toast(friendlyError(e), { err: true }); }
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Duplicate compounds: find likely pairs, merge two into one
+   * ------------------------------------------------------------------ */
+  function compoundUsage(id) {
+    return q1(`SELECT (SELECT count(*) FROM experiments WHERE ? IN (compound_a_id, compound_b_id)) AS e,
+      (SELECT count(*) FROM simulations WHERE ? IN (compound_a_id, compound_b_id)) AS s,
+      (SELECT count(*) FROM processed_results WHERE species_compound_id = ?) AS p`, [id, id, id]);
+  }
+  const MERGE_FIELDS = [
+    ['cas', 'CAS number'], ['smiles', 'SMILES'], ['name', 'Name'], ['formula', 'Formula'],
+    ['mw_g_mol', 'Molar mass (g/mol)'], ['density_g_cm3', 'Density (g/cm³)'],
+    ['hsp_d_mpa05', 'δD (MPa½)'], ['hsp_p_mpa05', 'δP (MPa½)'], ['hsp_h_mpa05', 'δH (MPa½)'],
+    ['source', 'Source'], ['comments', 'Comments'],
+  ];
+  const MERGE_BOTH = { source: '; ', comments: '\n' }; // free text: keeping both is the default
+
+  /**
+   * What merging `drop` into `keep` would store. A field blank in one takes the other's value; when both
+   * have different values, `choice[field]` picks 'keep', 'drop' or (free text) 'both'. The name not kept,
+   * and both compounds' other names, end up in other_names. Different CAS numbers block the merge.
+   */
+  function mergePlan(keep, drop, choice) {
+    const blank = v => v == null || String(v).trim() === '';
+    const same = (a, b) => (typeof a === 'number' && typeof b === 'number' ? a === b : String(a).trim() === String(b).trim());
+    const rows = [], values = {}, blocks = [];
+    for (const [k, label] of MERGE_FIELDS) {
+      const a = keep[k], b = drop[k];
+      let status, result, pick = null;
+      if (blank(a) && blank(b)) { status = 'none'; result = null; }
+      else if (blank(a)) { status = 'fill'; result = b; }
+      else if (blank(b) || same(a, b)) { status = 'same'; result = a; }
+      else if (k === 'cas') {
+        status = 'blocked'; result = a;
+        blocks.push(`They have different CAS numbers (${a} and ${b}), which means different compounds. If one is wrong, correct it in that compound first.`);
+      } else {
+        status = 'choose';
+        pick = choice[k] || (MERGE_BOTH[k] ? 'both' : 'keep');
+        result = pick === 'drop' ? b : pick === 'both' ? `${a}${MERGE_BOTH[k]}${b}` : a;
+      }
+      values[k] = result;
+      rows.push({ k, label, a, b, status, pick, result });
+    }
+    values.other_names = joinNames([keep.name, drop.name, ...splitNames(keep.other_names), ...splitNames(drop.other_names)].filter(Boolean), [values.name]);
+    const both = [keep.compound_id, drop.compound_id, drop.compound_id, keep.compound_id];
+    const mixes = [...q('SELECT experiment_id AS id FROM experiments WHERE (compound_a_id = ? AND compound_b_id = ?) OR (compound_a_id = ? AND compound_b_id = ?)', both).map(r => `experiment #${r.id}`),
+      ...q('SELECT simulation_id AS id FROM simulations WHERE (compound_a_id = ? AND compound_b_id = ?) OR (compound_a_id = ? AND compound_b_id = ?)', both).map(r => `simulation #${r.id}`)];
+    if (mixes.length) blocks.push(`${mixes.join(', ')} ${mixes.length === 1 ? 'is a mixture' : 'are mixtures'} of these two, which would become a mixture of a compound with itself. Change or delete ${mixes.length === 1 ? 'it' : 'them'} first.`);
+    if (values.smiles && values.smiles !== keep.smiles) {
+      const other = q1('SELECT compound_id, name, cas, smiles FROM compounds WHERE smiles = ? AND compound_id NOT IN (?, ?)', [values.smiles, keep.compound_id, drop.compound_id]);
+      if (other) blocks.push(`The SMILES ${values.smiles} also belongs to ${compoundLabel(other)}. Merge or fix that one first.`);
+    }
+    return { rows, values, blocks };
+  }
+
+  /** Which of two compounds to keep by default: CAS, then SMILES, then more filled-in values, then more use. */
+  function mergeRank(c) {
+    const u = compoundUsage(c.compound_id);
+    return [c.cas ? 1 : 0, c.smiles ? 1 : 0, MERGE_FIELDS.filter(([k]) => c[k] != null && c[k] !== '').length, u.e + u.s + u.p, -c.compound_id];
+  }
+  const rankCmp = (x, y) => { for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return y[i] - x[i]; return 0; };
+
+  /**
+   * Likely duplicates: compounds sharing a SMILES, or whose names (or other names) match once case,
+   * punctuation, a leading "n-" and a trailing abbreviation in brackets are ignored; the bracketed
+   * abbreviation is compared too, so "Tetrahydrofuran (THF)" pairs with "tetrahydrofuran" and "THF".
+   * Synonyms with different words (2-butanone, methyl ethyl ketone) can't be found this way.
+   */
+  function duplicatePairs() {
+    const comps = q('SELECT * FROM compounds');
+    const byId = new Map(comps.map(c => [c.compound_id, c]));
+    const groups = new Map(); // key -> Set of ids
+    const add = (key, id) => { if (!groups.has(key)) groups.set(key, new Set()); groups.get(key).add(id); };
+    const norm = t => t.replace(/^n-/, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    for (const c of comps) {
+      if (c.smiles) add(`smiles:${c.smiles.trim()}`, c.compound_id);
+      for (const n of [c.name, ...splitNames(c.other_names)].filter(Boolean)) {
+        const m = /^(.*\S)\s+\(([^()]+)\)\s*$/.exec(n.trim());
+        for (const part of m ? [m[1], m[2]] : [n]) { const k = norm(part.trim()); if (k.length >= 3) add(`name:${k}`, c.compound_id); }
+      }
+    }
+    const pairs = new Map();
+    for (const [key, ids] of groups) {
+      if (ids.size < 2) continue;
+      const members = [...ids].map(id => byId.get(id)).sort((x, y) => rankCmp(mergeRank(x), mergeRank(y)));
+      const keep = members[0];
+      for (const other of members.slice(1)) {
+        const pk = `${keep.compound_id}:${other.compound_id}`;
+        if (!pairs.has(pk)) pairs.set(pk, { keep, drop: other, reasons: new Set() });
+        pairs.get(pk).reasons.add(key.startsWith('smiles:') ? 'same SMILES' : 'similar names');
+      }
+    }
+    return [...pairs.values()].sort((x, y) => compoundLabel(x.keep).localeCompare(compoundLabel(y.keep)));
+  }
+
+  function drawerShell(title, body, foot) {
+    $('#overlay').innerHTML = `<div class="scrim" data-action="drawer-close"></div>
+      <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+        <div class="drawer-head"><div class="grow"><p class="eyebrow">Physical constants</p><h2 id="drawer-title">${esc(title)}</h2></div><button class="linkish" data-action="drawer-close">Close</button></div>
+        <div class="drawer-body">${body}</div>
+        <div class="drawer-foot" id="drawer-foot">${foot}</div>
+      </aside>`;
+  }
+
+  function openDuplicates() {
+    drawer = { table: 'compounds', mode: 'duplicates' };
+    const pairs = duplicatePairs();
+    const cell = c => `<strong>${esc(compoundLabel(c))}</strong>${c.cas && c.name ? ` <span class="muted mono" style="white-space:nowrap">${esc(c.cas)}</span>` : ''} <span class="muted">#${c.compound_id}</span>`;
+    const body = `<div class="form-sec"><p class="sub-note" style="margin:0">Listed: compounds that share a SMILES, or whose names match once upper/lower case, punctuation, a leading "n-" and a bracketed abbreviation at the end are ignored (so "Tetrahydrofuran (THF)" pairs with "tetrahydrofuran"). Names that use different words for the same chemical, such as 2-butanone and methyl ethyl ketone, can't be spotted this way: open either compound and use <em>Merge with another compound</em>.</p></div>
+      <div class="form-sec">${pairs.length ? `<div class="form-sec-title">${plural(pairs.length, 'possible pair')}</div>
+        <div class="table-wrap"><table class="data"><thead><tr><th>Keep</th><th>Merge in</th><th>Why</th><th></th></tr></thead><tbody>
+        ${pairs.map(p => `<tr><td style="white-space:normal">${cell(p.keep)}</td><td style="white-space:normal">${cell(p.drop)}</td><td>${esc([...p.reasons].join(', '))}${p.keep.cas && p.drop.cas && normCas(p.keep.cas) !== normCas(p.drop.cas) ? '<div class="sub-note">different CAS numbers</div>' : ''}</td>
+          <td><button type="button" class="btn sm" data-action="merge-review" data-keep="${p.keep.compound_id}" data-drop="${p.drop.compound_id}">Review</button></td></tr>`).join('')}
+        </tbody></table></div>` : '<p style="margin:0">No likely duplicates found.</p>'}</div>`;
+    drawerShell('Possible duplicates', body, `<button class="btn" data-action="merge-pick">Merge any two compounds…</button><span class="spacer"></span>`);
+  }
+
+  function openMerge(keepId, dropId, from) {
+    drawer = { table: 'compounds', mode: 'merge', merge: { keep: keepId ?? null, drop: dropId ?? null, choice: {}, from } };
+    renderMerge();
+  }
+
+  function renderMerge() {
+    const m = drawer.merge;
+    const list = compoundsList();
+    const options = sel => '<option value="">— choose a compound —</option>' + list.map(c => `<option value="${c.compound_id}" ${sel === c.compound_id ? 'selected' : ''}>${esc(compoundLabel(c))}${c.name && c.cas ? ` (${esc(c.cas)})` : ''} · #${c.compound_id}</option>`).join('');
+    const keep = m.keep != null ? loadRecord('compounds', m.keep) : null;
+    const drop = m.drop != null ? loadRecord('compounds', m.drop) : null;
+    const show = v => (v == null || String(v).trim() === '' ? '<span class="muted">—</span>' : esc(String(v)).replace(/\n/g, '<br>'));
+    let plan = null, detail = '';
+    if (keep && drop && keep.compound_id === drop.compound_id) detail = '<div class="form-sec"><p class="muted" style="margin:0">Choose two different compounds.</p></div>';
+    else if (keep && drop) {
+      plan = mergePlan(keep, drop, m.choice);
+      const u = compoundUsage(drop.compound_id);
+      const radio = (k, val, checked, label) => `<label style="display:inline-flex;gap:5px;align-items:center;margin-top:4px;font-size:12.5px"><input type="radio" name="pick_${k}" value="${val}" ${checked ? 'checked' : ''} data-merge-pick="${k}"> ${label}</label>`;
+      const note = { fill: 'filled in', same: '', none: '', blocked: 'different', choose: '' };
+      detail = `${plan.blocks.length ? `<div class="form-error" style="margin:14px 0 0">${plan.blocks.map(esc).join('<br>')}</div>` : ''}
+        <div class="form-sec"><div class="form-sec-title">What changes</div>
+          <p style="margin:0">Every experiment, simulation and processed result that uses <strong>${esc(compoundLabel(drop))}</strong> is moved to <strong>${esc(compoundLabel(keep))}</strong> (${plural(u.e, 'experiment')}, ${plural(u.s, 'simulation')}, ${plural(u.p, 'processed result')} as a species). Then ${esc(compoundLabel(drop))} is deleted. Its name is kept as another name of ${esc(compoundLabel(keep))}, so imports that use it still find the right compound. Undo reverses the whole merge.</p></div>
+        <div class="form-sec"><div class="form-sec-title">Values</div>
+          <div class="table-wrap"><table class="data"><thead><tr><th></th><th>Keep · #${keep.compound_id}</th><th>Merge in · #${drop.compound_id}</th><th>Result</th></tr></thead><tbody>
+          ${plan.rows.map(r => `<tr><td>${esc(r.label)}</td>
+            <td style="white-space:normal;max-width:180px;overflow-wrap:anywhere">${show(r.a)}${r.status === 'choose' ? `<div>${radio(r.k, 'keep', r.pick === 'keep', 'use')}</div>` : ''}</td>
+            <td style="white-space:normal;max-width:180px;overflow-wrap:anywhere">${show(r.b)}${r.status === 'choose' ? `<div>${radio(r.k, 'drop', r.pick === 'drop', 'use')}</div>` : ''}</td>
+            <td style="white-space:normal;max-width:200px;overflow-wrap:anywhere">${show(r.result)}${r.status === 'choose' && MERGE_BOTH[r.k] ? `<div>${radio(r.k, 'both', r.pick === 'both', 'keep both')}</div>` : ''}${note[r.status] ? `<div class="sub-note">${note[r.status]}</div>` : ''}</td></tr>`).join('')}
+          <tr><td>Other names</td><td style="white-space:normal">${show(keep.other_names)}</td><td style="white-space:normal">${show(drop.other_names)}</td><td style="white-space:normal">${show(plan.values.other_names)}</td></tr>
+          </tbody></table></div>
+          <p class="sub-note" style="margin:0">Where both have a different value, the kept compound's is used unless you pick the other (Source and Comments keep both by default). Values are shown exactly as stored.</p></div>`;
+    }
+    const body = `<div class="form-sec"><div class="form-grid">
+        <div class="field"><label for="merge-keep">Keep</label><select id="merge-keep">${options(m.keep)}</select></div>
+        <div class="field"><label for="merge-drop">Merge in, then delete</label><select id="merge-drop">${options(m.drop)}</select></div>
+      </div><div><button type="button" class="linkish" data-action="merge-swap">Swap</button></div></div>${detail}`;
+    const ok = plan && !plan.blocks.length;
+    drawerShell('Merge two compounds', body, `<button class="btn primary" data-action="merge-do" ${ok ? '' : 'disabled'}>Merge</button><span class="spacer"></span>${m.from === 'duplicates' ? '<button class="linkish" data-action="find-duplicates">Back to the list</button>' : ''}`);
+    $('#merge-keep').addEventListener('change', e => { m.keep = e.target.value ? Number(e.target.value) : null; m.choice = {}; renderMerge(); });
+    $('#merge-drop').addEventListener('change', e => { m.drop = e.target.value ? Number(e.target.value) : null; m.choice = {}; renderMerge(); });
+    $$('[data-merge-pick]').forEach(r => r.addEventListener('change', () => { m.choice[r.dataset.mergePick] = r.value; renderMerge(); }));
+  }
+
+  function doMerge() {
+    const m = drawer && drawer.merge;
+    if (!m) return;
+    const keep = loadRecord('compounds', m.keep), drop = loadRecord('compounds', m.drop);
+    if (!keep || !drop || keep.compound_id === drop.compound_id) return;
+    const plan = mergePlan(keep, drop, m.choice);
+    if (plan.blocks.length) return;
+    const k = keep.compound_id, d = drop.compound_id;
+    const u = compoundUsage(d);
+    try {
+      mutate(`Merge ${compoundLabel(drop)} into ${compoundLabel(keep)}`, () => {
+        // A processed result's species must be one of its simulation's compounds, and a simulation can't drop a
+        // compound its results still name, so the species is cleared, the records are moved, then it is set again.
+        const species = q('SELECT result_id FROM processed_results WHERE species_compound_id = ?', [d]).map(r => r.result_id);
+        if (species.length) run('UPDATE processed_results SET species_compound_id = NULL WHERE species_compound_id = ?', [d]);
+        for (const t of ['experiments', 'simulations']) for (const c of ['compound_a_id', 'compound_b_id']) run(`UPDATE ${t} SET ${c} = ? WHERE ${c} = ?`, [k, d]);
+        if (species.length) run(`UPDATE processed_results SET species_compound_id = ? WHERE result_id IN (${species.map(() => '?').join(', ')})`, [k, ...species]);
+        run('DELETE FROM compounds WHERE compound_id = ?', [d]); // first, so its name, CAS and SMILES are free
+        const cols = [...MERGE_FIELDS.map(([f]) => f), 'other_names'];
+        run(`UPDATE compounds SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE compound_id = ?`, [...cols.map(c => plan.values[c] ?? null), k]);
+      });
+      const moved = [u.e ? plural(u.e, 'experiment') : '', u.s ? plural(u.s, 'simulation') : '', u.p ? plural(u.p, 'processed result') : ''].filter(Boolean);
+      toast(`Merged ${compoundLabel(drop)} into ${compoundLabel(plan.values)}${moved.length ? `, moving ${moved.join(', ')}` : ''}. Undo reverses it.`);
+      if (m.from === 'duplicates') openDuplicates(); else openForm('compounds', k);
+    } catch (e) { toast(`Couldn't merge: ${friendlyError(e)}`, { err: true }); }
   }
 
   /** Read and validate the form. Returns {values, errors}. */
@@ -1359,6 +1671,24 @@
       for (const k of ['t2_err_s', 'diffusion_err_m2_s']) if (out[k] != null && out[k] < 0) errors[k] = 'Cannot be negative.';
     }
     if (drawer.table === 'processed_results' && out.uncertainty != null && out.uncertainty < 0) errors.uncertainty = 'Cannot be negative.';
+    if (drawer.table === 'compounds') {
+      if (out.cas != null) {
+        out.cas = normCas(out.cas);
+        if (!casCheckOk(out.cas)) errors.cas = 'Not a valid CAS number. They look like 71-43-2, and the last digit is a check digit.';
+      }
+      if (out.cas == null && out.smiles == null && out.name == null) errors.cas = 'Give at least one of CAS number, SMILES or name.';
+      if (out.other_names != null) {
+        out.other_names = joinNames(splitNames(out.other_names), [out.name]);
+        for (const n of splitNames(out.other_names)) {
+          const owner = nameOwner(n, drawer.id);
+          if (owner) { errors.other_names = `"${n}" is already a name of ${compoundLabel(owner)}.`; break; }
+        }
+      }
+      if (out.name != null && !errors.name) {
+        const owner = nameOwner(out.name, drawer.id);
+        if (owner && owner.name && owner.name.toLowerCase() !== out.name.toLowerCase()) errors.name = `"${out.name}" is listed as another name of ${compoundLabel(owner)}.`;
+      }
+    }
     return { values: out, errors };
   }
 
@@ -1430,7 +1760,7 @@
       if (bits.length) consequence = `This also removes ${bits.join(' and ')} linked to it.`;
     } else if (drawer.table === 'compounds') {
       const u = q1('SELECT (SELECT count(*) FROM experiments WHERE ? IN (compound_a_id, compound_b_id)) AS e, (SELECT count(*) FROM simulations WHERE ? IN (compound_a_id, compound_b_id)) AS s, (SELECT count(*) FROM processed_results WHERE species_compound_id = ?) AS p', [id, id, id]);
-      if (u.e || u.s || u.p) blocked = `${drawer.values.name} is used by ${[u.e ? plural(u.e, 'experiment') : '', u.s ? plural(u.s, 'simulation') : '', u.p ? plural(u.p, 'processed value') : ''].filter(Boolean).join(', ')}. Change or delete those first.`;
+      if (u.e || u.s || u.p) blocked = `${compoundLabel(drawer.values)} is used by ${[u.e ? plural(u.e, 'experiment') : '', u.s ? plural(u.s, 'simulation') : '', u.p ? plural(u.p, 'processed value') : ''].filter(Boolean).join(', ')}. Change or delete those first.`;
     } else if (drawer.table === 'quantities') {
       const n = q1('SELECT count(*) AS n FROM processed_results WHERE quantity = ?', [id]).n;
       if (n) blocked = `${plural(n, 'processed value uses', 'processed values use')} this quantity. Delete or change them first.`;
@@ -1469,7 +1799,7 @@
     ['Simulated vs measured T₂ (degassed only)', "SELECT compound_1, compound_2, x_1, temperature_exp_k,\n       sim_method, sim_value, exp_value,\n       round(pct_diff, 1) AS pct_diff\nFROM v_sim_vs_exp\nWHERE quantity = 'T2' AND exp_degassed = 1\nORDER BY compound_1, compound_2, x_1;"],
     ['T₂ across a mole-fraction sweep', "-- Replace the compound names with yours\nSELECT x_a, temperature_k, t2_s, t2_err_s, degassed\nFROM v_experiments\nWHERE compound_a = 'Benzene' AND compound_b = 'Toluene'\nORDER BY x_a;"],
     ['Intra / inter / total T₂ side by side', "-- One row per simulation. If a simulation has several methods,\n-- add  AND method = '...'  so max() picks the one you mean.\nSELECT simulation_id,\n  max(CASE WHEN contribution = 'intra' THEN value END) AS t2_intra_s,\n  max(CASE WHEN contribution = 'inter' THEN value END) AS t2_inter_s,\n  max(CASE WHEN contribution = 'total' THEN value END) AS t2_total_s\nFROM processed_results\nWHERE quantity = 'T2' AND species_compound_id IS NULL\nGROUP BY simulation_id;"],
-    ['Compounds missing Hansen parameters', 'SELECT name, hsp_d_mpa05, hsp_p_mpa05, hsp_h_mpa05\nFROM compounds\nWHERE hsp_d_mpa05 IS NULL OR hsp_p_mpa05 IS NULL OR hsp_h_mpa05 IS NULL;'],
+    ['Compounds missing Hansen parameters', 'SELECT coalesce(name, cas, smiles) AS compound, cas, hsp_d_mpa05, hsp_p_mpa05, hsp_h_mpa05\nFROM compounds\nWHERE hsp_d_mpa05 IS NULL OR hsp_p_mpa05 IS NULL OR hsp_h_mpa05 IS NULL;'],
     ['Records per user (exp vs sim)', 'SELECT kind, user_name, count(*) AS n\nFROM v_all_records\nGROUP BY kind, user_name\nORDER BY n DESC;'],
     ['Raw files for one compound', "SELECT linked_to, record_id, path, file_type\nFROM v_raw_data\nWHERE compound_a = 'Benzene' OR compound_b = 'Benzene'\nORDER BY linked_to, record_id;"],
   ];
@@ -1537,8 +1867,8 @@
   const norm = h => String(h ?? '').toLowerCase().replace(/δ/g, 'delta_').replace(/[([][^)\]]*[)\]]/g, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
   const F = (key, label, extra) => Object.assign({ key, label }, extra || {});
   const SAMPLE_FIELDS = [
-    F('compound_a', 'Compound A (name or CAS)', { aliases: ['compound_a', 'compound', 'compound_1', 'compound1', 'component_a', 'solvent_a', 'solvent', 'species_a', 'molecule', 'name', 'a', 'compounds'] }),
-    F('compound_b', 'Compound B (name or CAS)', { aliases: ['compound_b', 'compound_2', 'compound2', 'component_b', 'solvent_b', 'species_b', 'b'] }),
+    F('compound_a', 'Compound A (name, CAS or SMILES)', { aliases: ['compound_a', 'compound', 'compound_1', 'compound1', 'component_a', 'solvent_a', 'solvent', 'species_a', 'molecule', 'name', 'a', 'compounds'] }),
+    F('compound_b', 'Compound B (name, CAS or SMILES)', { aliases: ['compound_b', 'compound_2', 'compound2', 'component_b', 'solvent_b', 'species_b', 'b'] }),
     F('x_a', 'Mole fraction of A, x_A', { type: 'number', aliases: ['x_a', 'xa', 'x_1', 'x1', 'mole_fraction', 'mol_fraction', 'mole_fraction_a', 'mol_fraction_a', 'mol_fractions', 'mole_fractions', 'mol_frac', 'x'] }),
     F('x_b', 'Mole fraction of B, x_B', { type: 'number', aliases: ['x_b', 'xb', 'x_2', 'x2', 'mole_fraction_b', 'mol_fraction_b'] }),
     F('temperature_k', 'Temperature', { type: 'number', kind: 'temperature', aliases: ['temperature', 'temp', 'temperature_k', 'temp_k', 't_k'] }),
@@ -1552,10 +1882,11 @@
   ];
   const IMPORT = {
     compounds: { label: 'Compounds (physical constants)', fields: [
-      F('name', 'Name', { required: true, aliases: ['name', 'compound', 'compound_name', 'compounds', 'solvent', 'molecule', '_key', 'key'] }),
       F('cas', 'CAS number', { aliases: ['cas', 'cas_number', 'cas_no', 'casrn', 'cas_rn', 'cas_registry_number'] }),
-      F('formula', 'Formula', { aliases: ['formula', 'molecular_formula'] }),
       F('smiles', 'SMILES', { aliases: ['smiles', 'canonical_smiles', 'isomeric_smiles'] }),
+      F('name', 'Name', { aliases: ['name', 'compound', 'compound_name', 'compounds', 'solvent', 'molecule', '_key', 'key'] }),
+      F('other_names', 'Other names', { aliases: ['other_names', 'synonyms', 'aliases', 'also_known_as'] }),
+      F('formula', 'Formula', { aliases: ['formula', 'molecular_formula'] }),
       F('mw_g_mol', 'Molar mass (g/mol)', { type: 'number', aliases: ['mw', 'mw_g_mol', 'molar_mass', 'molecular_weight', 'mol_wt', 'molar_mass_g_mol'] }),
       F('density_g_cm3', 'Density (g/cm³)', { type: 'number', aliases: ['density', 'rho', 'density_g_cm3', 'density_g_ml'] }),
       F('hsp_d_mpa05', 'δD dispersion (MPa½)', { type: 'number', aliases: ['hsp_d', 'hsp_d_mpa05', 'delta_d', 'dd', 'dispersion', 'dispersive', 'hansen_d'] }),
@@ -1687,7 +2018,8 @@
     let best = 'experiments', score = -1;
     for (const [t, spec] of Object.entries(IMPORT)) {
       let s = spec.fields.reduce((acc, f) => acc + (n.some(h => f.aliases.includes(h)) ? 1 : 0), 0);
-      if (t === 'processed_results' && n.some(h => wideSpec(h))) s += 3;
+      // Script-result columns look like T2_intra, T2_total, D_A; a bare "T2" column is more likely a measurement.
+      if (t === 'processed_results' && n.some(h => /^(t1|t2|r1|r2|d|tau_c)_(intra|inter|total|tot|a|b|mix|err|error|sd)\b/.test(h))) s += 3;
       if (t === 'compounds' && n.some(h => ['delta_d', 'hsp_d', 'dd', 'cas'].includes(h))) s += 2;
       if (t === 'simulations' && n.some(h => ['force_field', 'ff', 'n_molecules_a', 'production_ns'].includes(h))) s += 2;
       if (t === 'experiments' && n.some(h => ['magnet', 'pulse_sequence', 'n_scans', 'degassed'].includes(h))) s += 2;
@@ -1763,7 +2095,7 @@
       const sheet = sheets[0];
       const target = guessTarget(sheet.header);
       imp = { fileName: file.name, sheets, sheetIdx: 0, target, mapping: autoMap(target, sheet.header),
-        options: { createCompounds: true, createSims: true, skipDuplicates: true, onExisting: 'skip', filterCol: '', filterVal: '' } };
+        options: { createCompounds: true, createSims: true, skipDuplicates: true, onExisting: 'skip', skipProblems: false, filterCol: '', filterVal: '' } };
       render();
     } catch (e) {
       toast(e.message || String(e), { err: true });
@@ -1779,6 +2111,47 @@
     const s = String(v).trim();
     return s === '' ? null : s;
   }
+  /** CAS numbers: trim, drop spaces and leading zeros so "0071-43-2" matches "71-43-2". */
+  function normCas(v) {
+    const t = impText(v);
+    return t === null ? null : t.replace(/\s+/g, '').replace(/^0+(?=\d)/, '');
+  }
+  /** CAS check digit: digits before it, read right to left, weighted 1, 2, 3 …; sum mod 10. */
+  function casCheckOk(c) {
+    const m = /^(\d{2,7})-(\d{2})-(\d)$/.exec(c);
+    if (!m) return false;
+    const sum = (m[1] + m[2]).split('').reverse().reduce((acc, d, i) => acc + Number(d) * (i + 1), 0);
+    return sum % 10 === Number(m[3]);
+  }
+  /**
+   * Does this text read as SMILES rather than a name? Every character has to
+   * tokenise as SMILES (organic-subset atoms, bracket atoms, bonds, branches,
+   * ring closures), with balanced branches and paired ring closures. Names
+   * almost always contain letters SMILES doesn't use (benzene, DMSO, EtOH),
+   * but a few short strings are ambiguous: "CCO" is read as ethanol's SMILES.
+   */
+  function looksLikeSmiles(text) {
+    const t = String(text || '').trim();
+    if (!t || /\s/.test(t)) return false;
+    const tokens = t.match(/Cl|Br|\[[^\]]+\]|%\d\d|[BCNOPSFI]|[bcnops]|[=#$:\/\\().+\-@*]|\d/g);
+    if (!tokens || tokens.join('') !== t) return false;
+    if (!tokens.some(k => /^(Cl|Br|\[.+\]|[BCNOPSFI]|[bcnops]|\*)$/.test(k))) return false;
+    let depth = 0; const open = {};
+    for (const k of tokens) {
+      if (k === '(') depth++;
+      else if (k === ')') { if (--depth < 0) return false; }
+      else if (/^(\d|%\d\d)$/.test(k)) open[k] = !open[k];
+    }
+    return depth === 0 && !Object.values(open).some(Boolean);
+  }
+  /** "CAS number, then SMILES, then name": the identifiers mapped in this import, in matching order. */
+  function matchKeysText() {
+    const has = k => imp.mapping.some(m => m.target === k);
+    const keys = [has('cas') && 'CAS number', has('smiles') && 'SMILES', has('name') && 'name'].filter(Boolean);
+    return keys.length ? keys.join(', then ') : 'CAS number, SMILES or name (map at least one)';
+  }
+  /** What to do with compound rows that match nothing in the database. */
+  function compoundNewMode() { const m = imp.options.newCompounds; return m === 'skip' || m === 'add-blank' ? m : 'add'; }
   function isoDate(d) { return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`; }
   function impDate(v, warn) {
     if (v === null || v === undefined || v === '') return null;
@@ -1821,32 +2194,77 @@
     const target = imp.target;
     const map = imp.mapping;
     const o = imp.options;
-    const res = { rows: 0, inserted: 0, updated: 0, dup: 0, filtered: 0, errors: [], warnings: new Set(), newCompounds: [], newSims: [], preview: [] };
+    const res = { rows: 0, inserted: 0, updated: 0, dup: 0, filtered: 0, errors: [], warnings: new Set(), newCompounds: [], newSims: [], preview: [],
+      unchanged: 0, newSkipped: 0, nameDiffs: [], namesFilled: 0, badCas: [], idWarnings: [], matchedBy: { cas: 0, smiles: 0, name: 0, other: 0 },
+      repeats: 0, combined: 0, same: 0, conflicts: [] };
     const warn = w => res.warnings.add(w);
 
-    const cIndex = new Map();
-    for (const c of q('SELECT compound_id, name, cas FROM compounds')) {
-      cIndex.set(c.name.toLowerCase(), c.compound_id);
-      if (c.cas) cIndex.set(c.cas.toLowerCase(), c.compound_id);
+    // Compounds can be named by name or CAS (case-insensitive) or by SMILES (exact text: SMILES is case-sensitive).
+    const cIndex = new Map(), smilesIndex = new Map();
+    for (const c of q('SELECT compound_id, name, cas, smiles FROM compounds')) {
+      if (c.name) cIndex.set(c.name.toLowerCase(), c.compound_id);
+      if (c.cas) cIndex.set(normCas(c.cas).toLowerCase(), c.compound_id);
+      if (c.smiles && c.smiles.trim()) { const k = c.smiles.trim(); smilesIndex.set(k, [...(smilesIndex.get(k) || []), c.compound_id]); }
     }
+    for (const c of q('SELECT compound_id, other_names FROM compounds WHERE other_names IS NOT NULL')) {
+      for (const n of splitNames(c.other_names)) if (!cIndex.has(n.toLowerCase())) cIndex.set(n.toLowerCase(), c.compound_id);
+    }
+    const lookupCompound = s => {
+      const k = s.toLowerCase();
+      if (cIndex.has(k)) return cIndex.get(k);
+      const nc = normCas(s);
+      if (nc && cIndex.has(nc.toLowerCase())) return cIndex.get(nc.toLowerCase());
+      const ids = smilesIndex.get(s.trim());
+      if (ids && ids.length > 1) throw new Error(`the SMILES ${s.trim()} belongs to ${ids.length} compounds in the database; use the name or CAS number instead`);
+      if (ids) return ids[0];
+      return undefined;
+    };
     let fakeId = -1;
+    let rowUndo = []; // lookups added by the current row, removed again if the row fails
     const compoundId = (raw, what) => {
       const s = impText(raw);
       if (s === null) return null;
       const k = s.toLowerCase();
-      if (cIndex.has(k)) return cIndex.get(k);
-      if (!o.createCompounds) throw new Error(`${what} "${s}" isn't in Physical constants (turn on "create missing compounds" or add it first)`);
-      const isCas = /^\d{2,7}-\d{2}-\d$/.test(s);
+      const found = lookupCompound(s);
+      if (found !== undefined) return found;
+      if (!o.createCompounds) throw new Error(`${what} "${s}" doesn't match any compound's name, CAS or SMILES (turn on "create missing compounds" or add it first)`);
+      const ncas = normCas(s);
+      const isCas = /^\d{2,7}-\d{2}-\d$/.test(ncas);
+      const isSmiles = !isCas && looksLikeSmiles(s);
       let id;
       if (dryRun) id = fakeId--;
-      else { run('INSERT INTO compounds (name, cas) VALUES (?, ?)', [s, isCas ? s : null]); id = lastId(); }
+      else { run('INSERT INTO compounds (cas, smiles, name) VALUES (?, ?, ?)', [isCas ? ncas : null, isSmiles ? s.trim() : null, isCas || isSmiles ? null : s]); id = lastId(); }
       cIndex.set(k, id);
+      rowUndo.push(() => cIndex.delete(k));
       res.newCompounds.push(s);
       return id;
     };
 
     const colOf = key => map.findIndex(m => m.target === key);
     const fieldSpec = key => IMPORT[target].fields.find(f => f.key === key);
+    // Compound import: separate lookups by CAS and by name.
+    const nameMapped = colOf('name') >= 0;
+    const newMode = compoundNewMode();
+    const compoundCols = IMPORT.compounds.fields.map(f => f.key).filter(k => colOf(k) >= 0);
+    // `written` remembers, per compound, which fields an earlier row of this file set (and from which row),
+    // so a compound named by several rows gets the first row's values plus whatever later rows add.
+    const byCas = new Map(), bySmiles = new Map(), byName = new Map(), byOther = new Map(), written = new Map();
+    const AMBIGUOUS = 'ambiguous';
+    const addOthers = e => { for (const n of e.others) { const k = n.toLowerCase(); if (!byName.has(k)) byOther.set(k, byOther.has(k) && byOther.get(k) !== e ? AMBIGUOUS : e); } };
+    if (target === 'compounds') {
+      const entries = q('SELECT * FROM compounds').map(c => ({
+        id: c.compound_id, name: c.name, cas: c.cas ? normCas(c.cas) : null, smiles: c.smiles ? c.smiles.trim() : null, others: splitNames(c.other_names), vals: c }));
+      for (const e of entries) {
+        if (e.name) byName.set(e.name.toLowerCase(), e);
+        if (e.cas) byCas.set(e.cas, e);
+        if (e.smiles) bySmiles.set(e.smiles, [...(bySmiles.get(e.smiles) || []), e]);
+      }
+      entries.forEach(addOthers); // names first, so a name always wins over someone's other name
+    }
+    const nameUser = lower => { const e = byName.get(lower) || byOther.get(lower); return e && e !== AMBIGUOUS ? e : null; };
+    const sameValue = (a, b) => (typeof a === 'number' && typeof b === 'number' ? Math.abs(a - b) <= 1e-12 * Math.max(1, Math.abs(a), Math.abs(b)) : String(a) === String(b));
+    const compoundFieldLabel = k => (IMPORT.compounds.fields.find(f => f.key === k) || { label: k }).label;
+    const sharedNoted = new Set();
     const filterIdx = o.filterCol === '' ? -1 : Number(o.filterCol);
 
     const readField = (cells, key) => {
@@ -1920,6 +2338,7 @@
       const id = dryRun ? fakeId-- : insert('simulations', rec);
       const s = { simulation_id: id, ...rec };
       sims.push(s); simById.set(id, s);
+      rowUndo.push(() => { sims.splice(sims.indexOf(s), 1); simById.delete(id); });
       res.newSims.push(`${id > 0 ? '#' + id : 'new'} at ${T != null ? fmtNum(T) + ' K' : 'unknown T'}`);
       return id;
     };
@@ -1930,7 +2349,7 @@
       if (!sim) throw new Error('species given but the simulation is unknown');
       if (s.toUpperCase() === 'A') return sim.compound_a_id;
       if (s.toUpperCase() === 'B') { if (sim.compound_b_id == null) throw new Error('species B given for a pure simulation'); return sim.compound_b_id; }
-      const id = cIndex.get(s.toLowerCase());
+      const id = lookupCompound(s);
       if (id == null || (id !== sim.compound_a_id && id !== sim.compound_b_id)) throw new Error(`species "${s}" isn't compound A or B of simulation #${simId}`);
       return id;
     };
@@ -1945,26 +2364,113 @@
       const rowNo = sheet.headerRow + 1 + i;
       if (filterIdx >= 0 && String(cells[filterIdx] ?? '').trim().toLowerCase() !== String(o.filterVal).trim().toLowerCase()) { res.filtered++; return; }
       res.rows++;
+      // If this row fails, everything it did is undone: its writes (savepoint), its counts and its lookups.
+      const snap = { inserted: res.inserted, updated: res.updated, dup: res.dup, unchanged: res.unchanged, newSkipped: res.newSkipped, namesFilled: res.namesFilled,
+        repeats: res.repeats, combined: res.combined, same: res.same,
+        lens: ['newCompounds', 'newSims', 'preview', 'nameDiffs', 'badCas', 'idWarnings', 'conflicts'].map(k => [k, res[k].length]), matchedBy: { ...res.matchedBy } };
+      rowUndo = [];
+      let failed = false;
+      if (!dryRun) run('SAVEPOINT import_row');
       try {
         if (target === 'compounds') {
+          // Recognise a compound by CAS number (1st), SMILES (2nd) and name (3rd), using whichever columns are
+          // mapped. The highest-ranked identifier that matches decides; a lower-ranked one that points at a
+          // different compound only raises a warning. Stored names and CAS numbers are never changed.
           const rec = {};
           for (const f of IMPORT.compounds.fields) { const v = readField(cells, f.key); if (v !== undefined) rec[f.key] = v; }
-          if (!rec.name) throw new Error('Name is empty');
-          const existing = cIndex.get(rec.name.toLowerCase()) ?? (rec.cas ? cIndex.get(rec.cas.toLowerCase()) : undefined);
-          if (existing != null && existing > 0) {
-            if (o.onExisting === 'update') {
-              const cols = Object.keys(rec).filter(k => rec[k] !== null && k !== 'name');
-              if (cols.length && !dryRun) run(`UPDATE compounds SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE compound_id = ?`, [...cols.map(c => rec[c]), existing]);
-              res.updated++;
-            } else res.dup++;
+          if (rec.cas !== undefined) rec.cas = normCas(rec.cas);
+          const fileOthers = splitNames(rec.other_names); // other names are added to, never replaced
+          delete rec.other_names;
+          const cas = rec.cas || null, smiles = rec.smiles || null, fileName = rec.name || null;
+          const lower = fileName ? fileName.toLowerCase() : null;
+          if (!cas && !smiles && !fileName) throw new Error(nameMapped ? 'no CAS number, SMILES or name to recognise the compound by' : 'no CAS number or SMILES, and the name column is set to ignore, so there is nothing to recognise the compound by');
+          if (cas && !casCheckOk(cas)) res.badCas.push(`row ${rowNo} (${cas})`);
+          // Several compounds can share a SMILES only in a database upgraded from version 1; say so once.
+          const owners = smiles ? bySmiles.get(smiles) || [] : [];
+          if (owners.length > 1 && !sharedNoted.has(smiles)) { sharedNoted.add(smiles); res.idWarnings.push(`${owners.map(compoundLabel).join(' and ')} have the same SMILES in the database, a possible duplicate`); }
+          let hit, how;
+          if (cas && byCas.has(cas)) { hit = byCas.get(cas); how = 'cas'; }
+          else if (owners.length) {
+            hit = owners.length === 1 ? owners[0] : owners.find(e => lower && e.name && e.name.toLowerCase() === lower);
+            if (!hit) throw new Error(`the SMILES matches ${owners.map(compoundLabel).join(' and ')}; add a CAS number or a matching name to choose one`);
+            how = 'smiles';
+          }
+          else if (lower && byName.has(lower)) { hit = byName.get(lower); how = 'name'; }
+          else if (lower && byOther.has(lower)) {
+            if (byOther.get(lower) === AMBIGUOUS) throw new Error(`"${fileName}" is listed as another name of more than one compound; add a CAS number or SMILES to choose one`);
+            hit = byOther.get(lower); how = 'other';
+          }
+          const keyName = { cas: 'CAS number', smiles: 'SMILES', name: 'name', other: 'other name' }[how];
+          // The row's CAS outranks the SMILES or name that matched: a different stored CAS means a different compound.
+          if (hit && how !== 'cas' && cas && hit.cas && hit.cas !== cas) throw new Error(`the ${keyName} matches ${compoundLabel(hit)}, which has CAS ${hit.cas} in the database, but this row says ${cas}`);
+          const pv = (action, name) => { const r = { action }; for (const f of compoundCols) r[f] = f === 'name' ? (name || '') : (rec[f] ?? ''); return r; };
+          // Other names from the file, minus any that already name a different compound.
+          const usableOthers = target => fileOthers.filter(n => {
+            const u = nameUser(n.toLowerCase());
+            if (u && u !== target) { res.idWarnings.push(`row ${rowNo}: "${n}" is already a name of ${compoundLabel(u)}, so it isn't added as another name`); return false; }
+            return true;
+          });
+          if (hit) {
+            const repeat = written.has(hit); // an earlier row of this file already matched this compound
+            if (!repeat) { written.set(hit, new Map()); rowUndo.push(() => written.delete(hit)); }
+            const smilesElsewhere = owners.length && !owners.includes(hit) ? owners[0] : null; // the SMILES is another compound's
+            const nameElse = lower ? nameUser(lower) : null;
+            const nameElsewhere = nameElse && nameElse !== hit ? nameElse : null;
+            if (smilesElsewhere) res.idWarnings.push(`row ${rowNo}: matched ${compoundLabel(hit)} by ${keyName}; its SMILES belongs to ${compoundLabel(smilesElsewhere)}, so the SMILES isn't copied`);
+            if (nameElsewhere) res.idWarnings.push(`row ${rowNo}: matched ${compoundLabel(hit)} by ${keyName}; the name "${fileName}" belongs to ${compoundLabel(nameElsewhere)}, a possible duplicate`);
+            if (repeat) res.repeats++; else res.matchedBy[how]++;
+            const knownName = lower && ((hit.name && hit.name.toLowerCase() === lower) || hit.others.some(n => n.toLowerCase() === lower));
+            if (fileName && hit.name && !knownName) res.nameDiffs.push(`${fileName} → ${hit.name}`);
+            if (o.onExisting !== 'update') { if (repeat) res.dup++; else res.unchanged++; return; }
+            const done = written.get(hit);
+            const fillName = !!(fileName && !hit.name && !nameElsewhere); // only a blank stored name gets the file's name
+            const cols = [], marks = [];
+            for (const k of Object.keys(rec)) {
+              if (rec[k] === null || (k === 'name' && !fillName) || (k === 'cas' && hit.cas) || (k === 'smiles' && (smilesElsewhere || smiles === hit.smiles))) continue;
+              if (done.has(k)) {
+                // A value an earlier row of this file gave stands; a different one here is reported.
+                const d = done.get(k);
+                const short = v => { const t = String(v); return t.length > 60 ? `${t.slice(0, 57)}…` : t; };
+                if (!sameValue(d.value, rec[k])) res.conflicts.push(`${compoundLabel(hit)}, ${compoundFieldLabel(k)}: row ${d.row} says "${short(d.value)}", row ${rowNo} says "${short(rec[k])}"`);
+                continue;
+              }
+              marks.push(k);
+              if (hit.vals[k] != null && sameValue(hit.vals[k], rec[k])) continue; // already stored: nothing to write
+              cols.push(k);
+            }
+            const others = joinNames([...hit.others, ...usableOthers(hit)], [fillName ? fileName : hit.name]);
+            const othersChanged = (others || '') !== (joinNames(hit.others) || '');
+            const sets = cols.map(c => [c, rec[c]]);
+            if (othersChanged) sets.push(['other_names', others]);
+            if (sets.length && !dryRun) run(`UPDATE compounds SET ${sets.map(([c]) => `${c} = ?`).join(', ')} WHERE compound_id = ?`, [...sets.map(([, v]) => v), hit.id]);
+            for (const c of marks) done.set(c, { value: rec[c], row: rowNo });
+            for (const c of cols) hit.vals[c] = rec[c];
+            if (fillName) { hit.name = fileName; byName.set(lower, hit); byOther.delete(lower); res.namesFilled++; }
+            if (cas && !hit.cas) { hit.cas = cas; byCas.set(cas, hit); }
+            if (cols.includes('smiles')) {
+              if (hit.smiles) bySmiles.set(hit.smiles, (bySmiles.get(hit.smiles) || []).filter(e => e !== hit));
+              hit.smiles = smiles; bySmiles.set(smiles, [hit]);
+            }
+            if (othersChanged) { hit.others = splitNames(others); addOthers(hit); }
+            if (!repeat) { if (sets.length) res.updated++; else res.same++; }
+            else if (sets.length) res.combined++;
+            else res.dup++;
+            if (sets.length && res.preview.length < 8) res.preview.push(pv('update', hit.name));
             return;
           }
-          if (existing != null && existing < 0) { res.dup++; return; }
-          const id = dryRun ? fakeId-- : insert('compounds', rec);
-          cIndex.set(rec.name.toLowerCase(), id);
-          if (rec.cas) cIndex.set(rec.cas.toLowerCase(), id);
+          if (newMode === 'skip') { res.newSkipped++; return; }
+          // Nothing matched, so none of the row's identifiers is taken. A row with only a name keeps it.
+          const name = newMode === 'add-blank' && (cas || smiles) ? null : fileName;
+          const others = joinNames(usableOthers(null), [name]);
+          const id = dryRun ? fakeId-- : insert('compounds', { ...rec, name, other_names: others });
+          const entry = { id, name, cas, smiles, others: splitNames(others), vals: { ...rec, name, other_names: others } };
+          written.set(entry, new Map(Object.keys(rec).filter(k => rec[k] !== null && k !== 'name').map(k => [k, { value: rec[k], row: rowNo }])));
+          if (name) byName.set(name.toLowerCase(), entry);
+          if (cas) byCas.set(cas, entry);
+          if (smiles) bySmiles.set(smiles, [entry]);
+          addOthers(entry);
           res.inserted++;
-          if (res.preview.length < 6) res.preview.push(rec);
+          if (res.preview.length < 8) res.preview.push(pv('add', name));
         } else if (target === 'experiments' || target === 'simulations') {
           const rec = sample(cells);
           for (const f of IMPORT[target].fields) {
@@ -2058,8 +2564,15 @@
           if (res.preview.length < 6) res.preview.push(rec);
         }
       } catch (e) {
+        failed = true;
+        const { lens, ...counts } = snap;
+        Object.assign(res, counts);
+        for (const [k, n] of lens) res[k].length = n;
+        rowUndo.forEach(f => f());
         res.errors.push({ row: rowNo, msg: e.message || String(e) });
-        if (!dryRun) throw new ImportRowError(rowNo, e);
+        if (!dryRun && !o.skipProblems) throw new ImportRowError(rowNo, e);
+      } finally {
+        if (!dryRun) { if (failed) run('ROLLBACK TO import_row'); run('RELEASE import_row'); }
       }
     });
     return res;
@@ -2069,7 +2582,7 @@
   function validateMapping() {
     const t = imp.target, map = imp.mapping, problems = [];
     const has = k => map.some(m => m.target === k);
-    if (t === 'compounds' && !has('name')) problems.push('Map a column to Name.');
+    if (t === 'compounds' && !has('name') && !has('cas') && !has('smiles')) problems.push('Map a column to CAS number, SMILES or Name, so rows can be matched to compounds.');
     if ((t === 'experiments' || t === 'simulations') && !has('compound_a')) problems.push('Map a column to Compound A.');
     if (t === 'raw_data' && !has('path')) problems.push('Map a column to Path or URL.');
     if (t === 'processed_results') {
@@ -2088,12 +2601,17 @@
     const problems = validateMapping();
     if (problems.length) return;
     const dry = runImport(true);
-    if (dry.errors.length) return;
+    if (dry.errors.length && !imp.options.skipProblems) return;
     try {
       const res = mutate(`Import ${imp.fileName}`, () => runImport(false));
       const parts = [`${res.inserted} added`];
       if (res.updated) parts.push(`${res.updated} updated`);
-      if (res.dup) parts.push(`${res.dup} skipped as duplicates`);
+      if (res.same) parts.push(`${res.same} already up to date`);
+      if (res.combined) parts.push(`${res.combined} repeated ${res.combined === 1 ? 'row' : 'rows'} combined`);
+      if (res.dup) parts.push(imp.target === 'compounds' ? `${res.dup} repeated ${res.dup === 1 ? 'row' : 'rows'} with nothing new` : `${res.dup} skipped as duplicates`);
+      if (res.unchanged) parts.push(`${res.unchanged} already in the database left unchanged`);
+      if (res.newSkipped) parts.push(`${res.newSkipped} not in the database skipped`);
+      if (res.errors.length) parts.push(`${plural(res.errors.length, 'row')} with problems skipped`);
       if (res.newCompounds.length) parts.push(`${plural(res.newCompounds.length, 'new compound')}`);
       if (res.newSims.length) parts.push(`${plural(res.newSims.length, 'new simulation')}`);
       const dest = { compounds: 'constants', experiments: 'experimental', simulations: 'simulated', processed_results: 'processed', raw_data: 'raw' }[imp.target];
@@ -2114,13 +2632,17 @@
       fresh.run('PRAGMA foreign_keys = ON');
       fresh.exec(window.NMRDB_SCHEMA);
       fresh.run('BEGIN');
+      // A backup made before version 2 may have two compounds with the same SMILES; let them in as an upgrade would.
+      fresh.run('DROP TRIGGER IF EXISTS compounds_smiles_unique_ins');
       for (const t of order) {
         for (const r of (b.tables[t] || [])) {
+          if (t === 'meta' && r.key === 'schema_version') continue; // the restored file has this version's structure
           const cols = Object.keys(r);
           if (!cols.length) continue;
           fresh.run(`INSERT OR REPLACE INTO ${t} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`, cols.map(c => (r[c] === undefined ? null : r[c])));
         }
       }
+      fresh.exec(window.NMRDB_SCHEMA); // puts the SMILES trigger back for new rows
       fresh.run('COMMIT');
       const bytes = fresh.export();
       fresh.close();
@@ -2201,7 +2723,7 @@
       return f && f.kind ? `<div class="valspec">${unitPicker(m, ci, f.kind)}</div>` : '';
     };
     const previewCols = dry && dry.preview.length ? Object.keys(dry.preview[0]) : [];
-    const cName = id => { if (id == null) return ''; if (id < 0) return '(new)'; const r = q1('SELECT name FROM compounds WHERE compound_id = ?', [id]); return r ? r.name : id; };
+    const cName = id => { if (id == null) return ''; if (id < 0) return '(new)'; const r = q1('SELECT name, cas, smiles FROM compounds WHERE compound_id = ?', [id]); return r ? compoundLabel(r) : id; };
     const showVal = (k, v) => /^compound_[ab]_id$|^species_compound_id$/.test(k) ? esc(cName(v)) : (k === 'simulation_id' && v < 0 ? '(new)' : typeof v === 'number' ? esc(fmtNum(v)) : esc(v ?? ''));
     main.innerHTML = `<section class="sec-head"><div class="sec-title"><div class="eyebrow">Tools · Import</div><h1>${esc(imp.fileName)}</h1>
       <p class="sec-desc">${plural(sheet.rows.length, 'data row')} under a header on row ${sheet.headerRow}. Match each column to a field, check the preview, then import.</p></div>
@@ -2209,10 +2731,12 @@
       <div class="sheet sheet-pad"><div class="form-grid">
         <div class="field"><label for="imp-target">Import into</label><select id="imp-target">${Object.entries(IMPORT).map(([k, v]) => `<option value="${k}" ${k === imp.target ? 'selected' : ''}>${esc(v.label)}</option>`).join('')}</select></div>
         ${imp.sheets.length > 1 ? `<div class="field"><label for="imp-sheet">Sheet</label><select id="imp-sheet">${imp.sheets.map((s, i) => `<option value="${i}" ${i === imp.sheetIdx ? 'selected' : ''}>${esc(s.name)} (${s.rows.length} rows)</option>`).join('')}</select></div>` : '<div></div>'}
-        <div class="field full"><div class="label">Options</div><div class="options">
+        <div class="field full"><div class="label">Options</div>${imp.target === 'compounds' ? `<p class="note" style="margin:0 0 6px">Rows are matched to compounds already in the database by ${matchKeysText()}. Stored names are never changed; a compound without a name gets the file's name when updating.${imp.mapping.some(m => m.target === 'name') ? '' : ' Name is set to ignore, so rows without a CAS number or SMILES can\'t be matched. Map it to use names as the third identifier.'}${imp.mapping.some(m => m.target === 'smiles') ? ' SMILES match on exact text, so they need to be written the same way as in the database (for example, both from PubChem).' : ''}</p>` : ''}<div class="options">
           ${imp.target !== 'compounds' && imp.target !== 'raw_data' ? `<label><input type="checkbox" data-opt="createCompounds" ${imp.options.createCompounds ? 'checked' : ''}> Create missing compounds</label>` : ''}
           ${imp.target === 'processed_results' ? `<label><input type="checkbox" data-opt="createSims" ${imp.options.createSims ? 'checked' : ''}> Create missing simulations</label>` : ''}
-          ${imp.target !== 'compounds' ? `<label><input type="checkbox" data-opt="skipDuplicates" ${imp.options.skipDuplicates ? 'checked' : ''}> Skip rows identical to existing records</label>` : `<label>Existing names: <select data-opt="onExisting" style="width:auto;height:28px"><option value="skip" ${imp.options.onExisting === 'skip' ? 'selected' : ''}>skip</option><option value="update" ${imp.options.onExisting === 'update' ? 'selected' : ''}>update with filled cells</option></select></label>`}
+          ${imp.target !== 'compounds' ? `<label><input type="checkbox" data-opt="skipDuplicates" ${imp.options.skipDuplicates ? 'checked' : ''}> Skip rows identical to existing records</label>` : `<label>Already in the database: <select data-opt="onExisting" style="width:auto;height:28px"><option value="skip" ${imp.options.onExisting !== 'update' ? 'selected' : ''}>leave unchanged</option><option value="update" ${imp.options.onExisting === 'update' ? 'selected' : ''}>update with the file's filled-in cells</option></select></label>
+            <label>Not in the database: <select data-opt="newCompounds" style="width:auto;height:28px"><option value="add" ${compoundNewMode() === 'add' ? 'selected' : ''}>add them</option><option value="add-blank" ${compoundNewMode() === 'add-blank' ? 'selected' : ''}>add them, name left blank if there's a CAS or SMILES</option><option value="skip" ${compoundNewMode() === 'skip' ? 'selected' : ''}>skip them</option></select></label>`}
+          <label><input type="checkbox" data-opt="skipProblems" ${imp.options.skipProblems ? 'checked' : ''}> Skip rows with problems and import the rest</label>
           <label>Only rows where <select data-opt="filterCol" style="width:auto;height:28px"><option value="">(all rows)</option>${sheet.header.map((h, i) => `<option value="${i}" ${String(imp.options.filterCol) === String(i) ? 'selected' : ''}>${esc(h)}</option>`).join('')}</select> = <input type="text" data-opt="filterVal" value="${esc(imp.options.filterVal)}" style="width:110px;height:28px" aria-label="Filter value"></label>
         </div></div>
       </div></div>
@@ -2223,16 +2747,26 @@
       <div class="sheet sheet-pad">
         <h2>Preview</h2>
         ${problems.length ? `<ul class="issues">${problems.map(p => `<li>${esc(p)}</li>`).join('')}</ul>` : `
-          <dl class="kv"><dt>Will add</dt><dd><strong>${dry.inserted}</strong> ${imp.target === 'processed_results' ? 'values' : 'rows'}${dry.updated ? ` · update ${dry.updated}` : ''}</dd>
-          ${dry.dup ? `<dt>Skipped</dt><dd>${dry.dup} already in the database</dd>` : ''}
+          <dl class="kv"><dt>Will add</dt><dd><strong>${dry.inserted}</strong> ${imp.target === 'processed_results' ? (dry.inserted === 1 ? 'value' : 'values') : (dry.inserted === 1 ? 'row' : 'rows')}${dry.updated ? ` · update ${dry.updated}` : ''}</dd>
+          ${dry.dup && imp.target !== 'compounds' ? `<dt>Skipped</dt><dd>${dry.dup} already in the database</dd>` : ''}
+          ${imp.target === 'compounds' && dry.repeats ? `<dt>Repeated</dt><dd>${plural(dry.repeats, 'row names', 'rows name')} a compound that an earlier row already matched. ${imp.options.onExisting === 'update' ? `${dry.repeats === 1 ? 'Its' : 'Their'} filled-in cells are added where the earlier row left a blank${dry.combined ? ` (${plural(dry.combined, 'row adds', 'rows add')} something)` : ' (nothing new here)'}; the earlier row's values stand.` : `${dry.repeats === 1 ? 'It is' : 'They are'} skipped.`}</dd>` : ''}
+          ${imp.target === 'compounds' && dry.conflicts.length ? `<dt>Conflicts</dt><dd>${esc(dry.conflicts.slice(0, 6).join('; '))}${dry.conflicts.length > 6 ? `; …and ${dry.conflicts.length - 6} more` : ''}. The earlier row's value is kept.</dd>` : ''}
+          ${imp.target === 'compounds' && (dry.matchedBy.cas + dry.matchedBy.smiles + dry.matchedBy.name + dry.matchedBy.other) ? `<dt>Recognised</dt><dd>${[['cas', 'by CAS'], ['smiles', 'by SMILES'], ['name', 'by name'], ['other', 'by other name']].filter(([k]) => dry.matchedBy[k]).map(([k, l]) => `${dry.matchedBy[k]} ${l}`).join(', ')}</dd>` : ''}
+          ${dry.same ? `<dt>Up to date</dt><dd>${plural(dry.same, 'compound already has', 'compounds already have')} every filled-in value in ${dry.same === 1 ? 'its row' : 'their rows'}, so nothing changes for ${dry.same === 1 ? 'it' : 'them'}.</dd>` : ''}
+          ${dry.unchanged ? `<dt>Left unchanged</dt><dd>${plural(dry.unchanged, 'compound is', 'compounds are')} already in the database. To fill in their values from this file, set "Already in the database" to update.</dd>` : ''}
+          ${dry.newSkipped ? `<dt>Skipped</dt><dd>${plural(dry.newSkipped, 'row')} not in the database</dd>` : ''}
+          ${dry.namesFilled ? `<dt>Names added</dt><dd>${plural(dry.namesFilled, 'compound has', 'compounds have')} no name yet and will get the file's name.</dd>` : ''}
+          ${dry.nameDiffs.length ? `<dt>Names kept</dt><dd>${plural(dry.nameDiffs.length, 'row names', 'rows name')} a compound differently from the database; the database ${dry.nameDiffs.length === 1 ? 'name is' : 'names are'} kept (${esc(dry.nameDiffs.slice(0, 6).join(', '))}${dry.nameDiffs.length > 6 ? ', …' : ''}).</dd>` : ''}
+          ${dry.badCas.length ? `<dt>Check CAS</dt><dd>${esc(dry.badCas.slice(0, 8).join(', '))}${dry.badCas.length > 8 ? ', …' : ''}: the check digit doesn't match, so ${dry.badCas.length === 1 ? 'it may be a typo' : 'these may be typos'}.</dd>` : ''}
           ${dry.filtered ? `<dt>Filtered out</dt><dd>${dry.filtered} rows</dd>` : ''}
           ${dry.newCompounds.length ? `<dt>New compounds</dt><dd>${esc([...new Set(dry.newCompounds)].join(', '))}</dd>` : ''}
           ${dry.newSims.length ? `<dt>New simulations</dt><dd>${dry.newSims.length} (sample + temperature only)</dd>` : ''}
-          ${dry.errors.length ? `<dt>Problems</dt><dd style="color:var(--bad)">${plural(dry.errors.length, 'row')}</dd>` : ''}</dl>
+          ${dry.idWarnings.length ? `<dt>Check matches</dt><dd>${esc(dry.idWarnings.slice(0, 5).join('; '))}${dry.idWarnings.length > 5 ? `; …and ${dry.idWarnings.length - 5} more` : ''}</dd>` : ''}
+          ${dry.errors.length ? `<dt>Problems</dt><dd style="color:var(--bad)">${plural(dry.errors.length, 'row')}${imp.options.skipProblems ? ', which will be skipped' : ''}</dd>` : ''}</dl>
           ${dry.warnings.has('slash-date') ? '<p class="sub-note">Dates written with slashes were read as month/day/year.</p>' : ''}
-          ${dry.errors.length ? `<ul class="issues">${dry.errors.slice(0, 40).map(e => `<li>Row ${e.row}: ${esc(e.msg)}</li>`).join('')}${dry.errors.length > 40 ? `<li>…and ${dry.errors.length - 40} more</li>` : ''}</ul><p class="sub-note">Fix these in the file (or change the mapping) and the preview updates. Nothing is imported while any row has a problem.</p>` : ''}
-          ${previewCols.length ? `<div class="table-wrap" style="margin-top:12px"><table class="data"><thead><tr>${previewCols.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${dry.preview.map(r => `<tr>${previewCols.map(c => `<td>${showVal(c, r[c])}</td>`).join('')}</tr>`).join('')}</tbody></table></div><p class="sub-note">First rows as they will be stored (base units: s, m²/s, K).</p>` : ''}`}
-        <div class="template-row" style="margin-top:14px"><button class="btn primary" data-action="import-do" ${problems.length || !dry || dry.errors.length || (!dry.inserted && !dry.updated) ? 'disabled' : ''}>Import ${dry ? dry.inserted + dry.updated : ''}</button><button class="btn ghost" data-action="import-reset">Cancel</button></div>
+          ${dry.errors.length ? `<ul class="issues">${dry.errors.slice(0, 40).map(e => `<li>Row ${e.row}: ${esc(e.msg)}</li>`).join('')}${dry.errors.length > 40 ? `<li>…and ${dry.errors.length - 40} more</li>` : ''}</ul><p class="sub-note">${imp.options.skipProblems ? 'These rows will be skipped and everything else imported.' : 'Fix these in the file or the mapping and the preview updates, or tick "Skip rows with problems" to import the rest.'}</p>` : ''}
+          ${previewCols.length ? `<div class="table-wrap" style="margin-top:12px"><table class="data"><thead><tr>${previewCols.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${dry.preview.map(r => `<tr>${previewCols.map(c => `<td>${showVal(c, r[c])}</td>`).join('')}</tr>`).join('')}</tbody></table></div><p class="sub-note">First rows as they will be stored (base units: s, m²/s, K).${imp.target === 'compounds' && dry.updated ? ' In updated rows, blank cells leave the stored value as it is.' : ''}</p>` : ''}`}
+        <div class="template-row" style="margin-top:14px"><button class="btn primary" data-action="import-do" ${problems.length || !dry || (dry.errors.length && !imp.options.skipProblems) || (!dry.inserted && !dry.updated && !dry.combined) ? 'disabled' : ''}>Import ${dry ? dry.inserted + dry.updated + dry.combined : ''}</button><button class="btn ghost" data-action="import-reset">Cancel</button></div>
       </div>`;
     wireImport();
   }
@@ -2292,21 +2826,28 @@
     const ver = q1('SELECT sqlite_version() AS v').v;
     const objs = q("SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name").map(r => r.name);
     main.innerHTML = `<section class="sec-head"><div class="sec-title"><p class="eyebrow">Tools</p><h1>Export and settings</h1>
-      <p class="sec-desc">Download the database, share it through the repository, and set how simulations are matched to experiments.</p></div></section>
+      <p class="sec-desc">Link the lab's master file, download copies, and set how simulations are matched to experiments.</p></div></section>
       <div class="split">
-        <div><h2>Download</h2>
+        <div><h2>Master file</h2>
+          ${!fsSupported ? `<p class="sec-desc">This browser can't save straight to a file; Chrome and Edge can. Here, open <span class="mono">master.sqlite</span> from the shared folder, make your changes, then download a copy and replace <span class="mono">master.sqlite</span> in the folder with it, keeping the name.</p>
+              <div class="template-row"><button class="btn primary" data-action="open-file">Open a .sqlite file…</button><button class="btn" data-action="download-sqlite">Download .sqlite</button></div>`
+          : state.master ? `<dl class="kv"><dt>File</dt><dd class="mono">${esc(state.master.name)}</dd>
+              <dt>Status</dt><dd>${!state.master.ready ? 'Not opened yet in this session' : state.dirty ? 'You have changes that aren\'t saved to it' : 'Up to date'}</dd>
+              <dt>Last synced</dt><dd>${state.master.syncedAt ? esc(fmtTime(state.master.syncedAt)) : '—'}</dd></dl>
+              <div class="template-row" style="margin-top:14px"><button class="btn primary" data-action="master-save">Save to master</button><button class="btn" data-action="master-reload">Check for newer version</button><button class="btn ghost" data-action="master-unlink">Unlink</button></div>
+              <p class="note" style="margin-top:10px">Browsers show the file name but not its folder. The sync app uploads each save. To undo a bad save, use the drive's version history (OneDrive and Google Drive keep about 30 days).</p>`
+          : `<ol class="steps-list" style="margin-top:12px">
+              <li><span>Keep <span class="mono">master.sqlite</span> in the lab's shared folder (OneDrive, Google Drive or Box) that syncs to your computer.</span></li>
+              <li><span>Open it here once. This browser remembers it.</span></li>
+              <li><span>Edit, then Save to master (or Ctrl+S).</span></li></ol>
+              <div class="template-row" style="margin-top:14px"><button class="btn primary" data-action="master-open">Open master file…</button><button class="btn" data-action="master-create">Create master file…</button></div>
+              <p class="note" style="margin-top:10px">Create master file saves what's in this browser as a new file; use it once to start the master.</p>`}
+          <h2 style="margin-top:28px">Download</h2>
           <dl class="kv">
-            <dt>Whole database</dt><dd><div class="template-row"><button class="btn primary" data-action="download-sqlite">Download database.sqlite</button><button class="btn" data-action="download-json">Download JSON backup</button></div>
+            <dt>Whole database</dt><dd><div class="template-row"><button class="btn" data-action="download-sqlite">Download database.sqlite</button><button class="btn" data-action="download-json">Download JSON backup</button></div>
               <p class="sub-note" style="margin:6px 0 0">The .sqlite file opens in Python (sqlite3, pandas), DB Browser for SQLite and R. The JSON backup can be restored through Import.</p></dd>
             <dt>One table or view</dt><dd><div class="template-row"><select id="export-obj" style="width:auto">${objs.map(o => `<option>${esc(o)}</option>`).join('')}</select><button class="btn" data-action="export-obj">Download CSV</button></div></dd>
           </dl>
-          <h2 style="margin-top:22px">Share through GitHub</h2>
-          <ol class="steps-list">
-            <li>Download <span class="mono">database.sqlite</span>.</li>
-            <li>In the repository, replace <span class="mono">${REPO_DB_PATH}</span> with it and commit. GitHub's "Add file → Upload files" works.</li>
-            <li>After GitHub Pages redeploys, usually within a couple of minutes, people who open the site get a notice offering the new version.</li>
-          </ol>
-          <p class="note" style="margin-top:10px">Two people editing at once each have their own working copy; the last file committed wins. Agree on who commits, or merge by exporting and importing CSVs.</p>
         </div>
         <div><h2>Sim vs exp matching</h2>
           <form id="tol-form" class="form-grid" style="margin-top:10px" novalidate>
@@ -2317,7 +2858,7 @@
           <h2 style="margin-top:22px">Database</h2>
           <dl class="kv"><dt>Engine</dt><dd>SQLite ${esc(ver)} via sql.js (${esc(state.engine)})</dd><dt>Schema version</dt><dd>${esc(metaGet('schema_version') ?? '?')}</dd>
             <dt>Created</dt><dd>${esc(metaGet('created_at') ?? '—')}</dd><dt>Last change</dt><dd>${esc(metaGet('modified_at') ?? '—')}</dd></dl>
-          <div class="template-row" style="margin-top:14px"><button class="btn" data-action="open-file">Open a .sqlite file…</button>${location.protocol !== 'file:' ? '<button class="btn" data-action="load-repo-check">Load the repository copy</button>' : ''}<button class="btn danger" data-action="new-db">Start an empty database</button></div>
+          <div class="template-row" style="margin-top:14px"><button class="btn" data-action="open-file">Open a .sqlite file…</button>${state.repoAvailable ? '<button class="btn" data-action="load-repo-check">Load the repository copy</button>' : ''}<button class="btn danger" data-action="new-db">Start an empty database</button></div>
         </div>
       </div>`;
     $('#tol-form').addEventListener('submit', e => {
@@ -2342,10 +2883,11 @@
       return false;
     }
     state.schemaNewer = s.newer ? s.version : null;
+    schemaNotice(s);
     if (before) pushUndo(how.label, before);
     state.currentBytes = exportBytes();
     state.source = how.source;
-    state.dirty = how.dirty;
+    state.dirty = state.master && !how.fromMaster ? true : how.dirty;
     if (how.repoHash !== undefined) state.repoHash = how.repoHash;
     persistNow();
     closeDrawer();
@@ -2357,7 +2899,7 @@
     const bytes = new Uint8Array(await file.arrayBuffer());
     if (!isSqlite(bytes)) { toast(`${file.name} isn't a SQLite database file.`, { err: true }); return; }
     const go = () => { if (replaceDatabase(bytes, { label: `Open ${file.name}`, source: 'file', dirty: false })) { toast(`Opened ${file.name}. Undo returns to the previous database.`); location.hash = 'overview'; } };
-    if (state.dirty) modal({ title: 'Replace your working copy?', body: 'Your working copy has changes that haven\'t been downloaded. Opening this file replaces it (Undo can bring it back while this tab stays open).', actions: [{ label: 'Download working copy first', onClick: () => downloadSqlite().then(go) }, { label: 'Replace', kind: 'danger', onClick: go }, { label: 'Cancel', kind: 'ghost' }] });
+    if (state.dirty) modal({ title: 'Replace your browser copy?', body: `Your browser copy has unsaved changes. Opening this file replaces it; Undo brings it back while this tab stays open.${state.master ? ` To make this file the new master, use Save to master afterwards.` : ''}`, actions: [{ label: 'Download my copy first', onClick: () => downloadSqlite(`my-copy-${today()}.sqlite`).then(go) }, { label: 'Replace', kind: 'danger', onClick: go }, { label: 'Cancel', kind: 'ghost' }] });
     else go();
   }
 
@@ -2370,9 +2912,176 @@
     else go();
   }
 
-  async function downloadSqlite() {
-    const ok = await saveFile('database.sqlite', state.currentBytes || exportBytes(), 'application/vnd.sqlite3');
-    if (ok) { state.dirty = false; persistNow(); renderStatus(); }
+  async function downloadSqlite(name) {
+    const ok = await saveFile(name || 'database.sqlite', state.currentBytes || exportBytes(), 'application/vnd.sqlite3');
+    if (ok && !state.master) { state.dirty = false; persistNow(); renderStatus(); }
+    return ok;
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Master file in a shared folder (File System Access API: Chrome, Edge)
+   *  The lab keeps master.sqlite in a synced folder (OneDrive, Google
+   *  Drive, Box). This browser remembers the file handle in IndexedDB,
+   *  reads the file and writes back to it. A SHA-256 of the file taken at
+   *  every load and save shows when someone else saved in between.
+   * ------------------------------------------------------------------ */
+  const fsSupported = typeof window.showOpenFilePicker === 'function' && typeof window.showSaveFilePicker === 'function';
+  const SQLITE_TYPES = [{ description: 'SQLite database', accept: { 'application/x-sqlite3': ['.sqlite', '.sqlite3', '.db'] } }];
+  let masterBusy = false;
+
+  async function digest(bytes) {
+    try {
+      if (window.crypto && crypto.subtle) {
+        const h = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+        return Array.from(h, b => b.toString(16).padStart(2, '0')).join('');
+      }
+    } catch (_) { /* fall back below */ }
+    return hashBytes(bytes);
+  }
+  async function storeMaster() {
+    try {
+      const m = state.master;
+      if (m) await idbPut('master', { handle: m.handle, name: m.name, hash: m.hash, syncedAt: m.syncedAt });
+      else await idbDelete('master');
+    } catch (e) { console.warn('Could not remember the master file', e); }
+  }
+  async function hasPermission(handle, mode, ask) {
+    try {
+      if ((await handle.queryPermission({ mode })) === 'granted') return true;
+      return ask ? (await handle.requestPermission({ mode })) === 'granted' : false;
+    } catch (_) { return false; }
+  }
+  async function readHandle(handle) {
+    const file = await handle.getFile();
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    return { bytes, hash: await digest(bytes), name: file.name, size: file.size };
+  }
+  function masterErr(e, what) {
+    if (e && e.name === 'AbortError') return; // the file picker was cancelled
+    if (e && e.name === 'NotFoundError') { state.masterNotice = 'missing'; render(); return; }
+    if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) { toast(`The browser didn't allow access to ${what}. Try again and choose Allow.`, { err: true }); return; }
+    if (e && e.name === 'NoModificationAllowedError') { toast('The file is busy, probably because the sync app is uploading it. Try again in a moment.', { err: true }); return; }
+    toast(`Couldn't use ${what}: ${e && e.message || e}`, { err: true });
+  }
+
+  /** Make `read` (a master file just read from disk) the working copy. */
+  function adoptMaster(handle, read) {
+    if (!replaceDatabase(read.bytes, { label: `Load ${read.name}`, source: 'master', dirty: false, fromMaster: true })) return false;
+    state.master = { handle, name: read.name, hash: read.hash, syncedAt: nowIso(), ready: true };
+    state.masterNotice = null;
+    storeMaster(); persistNow(); render();
+    return true;
+  }
+
+  async function openMaster() {
+    if (!fsSupported || state.mode === 'example') return;
+    let handle, read;
+    try { [handle] = await window.showOpenFilePicker({ types: SQLITE_TYPES, multiple: false }); }
+    catch (e) { masterErr(e, 'the file'); return; }
+    try { read = await readHandle(handle); } catch (e) { masterErr(e, 'the file'); return; }
+    if (read.size === 0) { // an empty file: make the current database its first content
+      const prev = state.master;
+      state.master = { handle, name: read.name, hash: read.hash, syncedAt: null, ready: true };
+      try { await writeMaster(); } catch (e) { state.master = prev; masterErr(e, read.name); }
+      return;
+    }
+    if (!isSqlite(read.bytes)) { toast(`${read.name} isn't a SQLite database file.`, { err: true }); return; }
+    if (state.master && read.hash === state.master.hash) { // same content as the linked master (e.g. it was moved): relink, keep local edits
+      Object.assign(state.master, { handle, name: read.name, ready: true });
+      state.masterNotice = null; storeMaster(); render();
+      toast(`Linked to ${read.name} again.`);
+      return;
+    }
+    const go = () => { if (adoptMaster(handle, read)) { toast(`Opened ${read.name}. Save to master writes your changes back to it.`); location.hash = 'overview'; } };
+    if (state.dirty) modal({ title: 'Replace your browser copy?', body: `Your browser copy has changes that aren't saved to a file. Opening ${esc(read.name)} replaces them; Undo brings them back while this tab stays open. To start the master from your browser copy instead, use Create master file.`, actions: [
+      { label: 'Download my copy first', onClick: () => downloadSqlite(`my-copy-${today()}.sqlite`).then(go) },
+      { label: `Open ${read.name}`, kind: 'danger', onClick: go }, { label: 'Cancel', kind: 'ghost' }] });
+    else go();
+  }
+
+  async function createMaster() {
+    if (!fsSupported || state.mode === 'example') return;
+    let handle;
+    try { handle = await window.showSaveFilePicker({ suggestedName: 'master.sqlite', types: SQLITE_TYPES }); }
+    catch (e) { masterErr(e, 'the file'); return; }
+    const prev = state.master;
+    state.master = { handle, name: handle.name, hash: null, syncedAt: null, ready: true };
+    try { await writeMaster(); } catch (e) { state.master = prev; masterErr(e, handle.name); render(); }
+  }
+
+  async function writeMaster() {
+    const m = state.master;
+    const bytes = state.currentBytes || exportBytes();
+    const w = await m.handle.createWritable();
+    await w.write(bytes);
+    await w.close();
+    m.hash = await digest(bytes); m.syncedAt = nowIso(); m.ready = true;
+    state.dirty = false; state.masterNotice = null;
+    await storeMaster(); persistNow(); render();
+    toast(`Saved to ${m.name}.`);
+  }
+
+  async function saveToMaster(opts = {}) {
+    if (state.mode === 'example' || masterBusy) return;
+    if (!state.master) { if (fsSupported) await createMaster(); else await downloadSqlite(); return; }
+    const m = state.master;
+    if (!(await hasPermission(m.handle, 'readwrite', true))) { toast(`Saving needs permission to edit ${m.name}. Click Save to master again and choose Allow.`, { err: true }); return; }
+    masterBusy = true;
+    try {
+      if (!opts.force) {
+        const cur = await readHandle(m.handle);
+        if (m.hash && cur.hash !== m.hash) { conflictOnSave(cur); return; }
+      }
+      await writeMaster();
+    } catch (e) { masterErr(e, m.name); }
+    finally { masterBusy = false; }
+  }
+
+  function conflictOnSave(cur) {
+    const m = state.master;
+    modal({ title: `${m.name} changed after you opened it`, body: `Someone else saved ${esc(m.name)} after this browser last loaded it. Saving now would replace their changes with yours.`, actions: [
+      { label: 'Download mine, load theirs', onClick: () => downloadSqlite(`my-changes-${today()}.sqlite`).then(() => { if (adoptMaster(m.handle, cur)) toast(`Loaded the latest ${m.name}. Your version was downloaded.`); }) },
+      { label: 'Overwrite with mine', kind: 'danger', onClick: () => saveToMaster({ force: true }) },
+      { label: 'Cancel', kind: 'ghost' }] });
+  }
+
+  function conflictOnLoad(cur) {
+    const m = state.master;
+    modal({ title: `${m.name} has newer changes`, body: `Someone else saved ${esc(m.name)}, and you also have changes here that aren't saved to it. Loading theirs replaces yours.`, actions: [
+      { label: 'Download mine, load theirs', onClick: () => downloadSqlite(`my-changes-${today()}.sqlite`).then(() => { if (adoptMaster(m.handle, cur)) toast(`Loaded the latest ${m.name}. Your version was downloaded.`); }) },
+      { label: 'Load theirs', kind: 'danger', onClick: () => { if (adoptMaster(m.handle, cur)) toast(`Loaded the latest ${m.name}.`); } },
+      { label: 'Keep mine', kind: 'ghost' }] });
+  }
+
+  /** Compare the master file with what this browser last loaded or saved.
+   *  ask: may show the browser's permission prompt (needs a click).
+   *  auto: background check; never interrupts an open form or dialog. */
+  async function checkMaster({ ask = false, auto = false } = {}) {
+    const m = state.master;
+    if (!m || state.mode === 'example' || masterBusy) return;
+    if (!(await hasPermission(m.handle, ask ? 'readwrite' : 'read', ask))) { m.ready = false; state.masterNotice = 'permission'; render(); return; }
+    let cur;
+    try { cur = await readHandle(m.handle); }
+    catch (e) { if (e && e.name === 'NotFoundError') { state.masterNotice = 'missing'; render(); } else if (!auto) masterErr(e, m.name); return; }
+    m.ready = true;
+    if (cur.hash === m.hash) {
+      state.masterNotice = null; render();
+      if (!auto) toast(state.dirty ? `${m.name} hasn't changed since you opened it. Your unsaved changes are still here.` : `Up to date with ${m.name}.`);
+      return;
+    }
+    const busy = drawer || $('.modal') || imp;
+    if (!state.dirty && !(auto && busy)) { if (adoptMaster(m.handle, cur)) toast(`Loaded the latest ${m.name}.`); return; }
+    state.masterNotice = 'changed'; render();
+    if (!auto) conflictOnLoad(cur);
+  }
+
+  function unlinkMaster() {
+    if (!state.master) return;
+    const name = state.master.name;
+    state.master = null; state.masterNotice = null;
+    if (state.dirty === false && state.source === 'master') state.source = 'browser';
+    storeMaster(); render();
+    toast(`Unlinked ${name}. Your browser copy is unchanged.`);
   }
 
   /* ------------------------------------------------------------------ *
@@ -2381,10 +3090,10 @@
   function seedExample() {
     const SRC_B = 'Example. δD/δP/δH: Hansen, HSP: A User\'s Handbook, 2nd ed. (2007). M and ρ: Wikipedia infobox (temperature for ρ not stated there).';
     const SRC_T = 'Example. δD/δP/δH: Hansen, HSP: A User\'s Handbook, 2nd ed. (2007). M and ρ (25 °C): Wikipedia infobox.';
-    run(`INSERT INTO compounds (name, cas, formula, mw_g_mol, density_g_cm3, hsp_d_mpa05, hsp_p_mpa05, hsp_h_mpa05, source) VALUES
-      ('Benzene', '71-43-2', 'C6H6', 78.114, 0.8765, 18.4, 0.0, 2.0, ?),
-      ('Toluene', '108-88-3', 'C7H8', 92.141, 0.8623, 18.0, 1.4, 2.0, ?),
-      ('Ethanol', '64-17-5', 'C2H6O', 46.069, NULL, 15.8, 8.8, 19.4, 'Example. δD/δP/δH: Hansen (2007). Density left blank on purpose.')`, [SRC_B, SRC_T]);
+    run(`INSERT INTO compounds (name, cas, smiles, formula, mw_g_mol, density_g_cm3, hsp_d_mpa05, hsp_p_mpa05, hsp_h_mpa05, source) VALUES
+      ('Benzene', '71-43-2', 'c1ccccc1', 'C6H6', 78.114, 0.8765, 18.4, 0.0, 2.0, ?),
+      ('Toluene', '108-88-3', 'Cc1ccccc1', 'C7H8', 92.141, 0.8623, 18.0, 1.4, 2.0, ?),
+      ('Ethanol', '64-17-5', 'CCO', 'C2H6O', 46.069, NULL, 15.8, 8.8, 19.4, 'Example. δD/δP/δH: Hansen (2007). Density left blank on purpose.')`, [SRC_B, SRC_T]);
     const note = 'EXAMPLE: synthetic value, not a measurement';
     const sweep = [[1, 15.8, 0.4, 2.21e-9], [0.7, 14.9, 0.4, 2.27e-9], [0.5, 14.1, 0.3, 2.31e-9], [0.3, 13.6, 0.3, 2.35e-9], [0, 12.9, 0.3, 2.40e-9]];
     sweep.forEach(([x, t2, e, d], i) => {
@@ -2467,6 +3176,12 @@
     'drawer-duplicate': () => duplicateDrawer(),
     'add-result-for-sim': t => openForm('processed_results', null, { simulation_id: Number(t.dataset.id) }),
     'create-compound': () => createCompoundInline(),
+    'find-duplicates': () => openDuplicates(),
+    'merge-from': t => openMerge(Number(t.dataset.id), null, 'form'),
+    'merge-pick': () => openMerge(null, null, 'duplicates'),
+    'merge-review': t => openMerge(Number(t.dataset.keep), Number(t.dataset.drop), 'duplicates'),
+    'merge-swap': () => { const m = drawer && drawer.merge; if (!m) return; [m.keep, m.drop] = [m.drop, m.keep]; m.choice = {}; renderMerge(); },
+    'merge-do': () => doMerge(),
     'cancel-compound': () => { $('#new-compound-row').hidden = true; if (pendingCompoundSelect) pendingCompoundSelect.value = ''; },
     'set-tab': t => { state.tabs[t.dataset.route] = t.dataset.tab; render(); },
     'sort': t => {
@@ -2486,6 +3201,11 @@
     'cmp-qty': t => { state.compare.quantity = t.dataset.q; state.compare.method = ''; render(); },
     'undo': () => undo(),
     'download-sqlite': () => downloadSqlite(),
+    'master-open': () => openMaster(),
+    'master-create': () => createMaster(),
+    'master-save': () => saveToMaster(),
+    'master-reload': () => checkMaster({ ask: true }),
+    'master-unlink': () => unlinkMaster(),
     'download-json': () => saveFile(`nmr-relaxation-db-backup-${today()}.json`, backupJson(), 'application/json'),
     'export-obj': () => {
       const name = $('#export-obj').value;
@@ -2524,6 +3244,7 @@
       if (e.key === 'Enter' && !typing && document.activeElement && document.activeElement.matches('tr[data-action="open-row"]')) document.activeElement.click();
       if (e.key === '/' && !typing && !drawer) { const s = $('input.search'); if (s) { e.preventDefault(); s.focus(); } }
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !typing && !drawer && state.mode === 'normal') { e.preventDefault(); undo(); }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); if (state.mode === 'normal' && !drawer) { if (state.master) saveToMaster(); else downloadSqlite(); } }
     });
     document.addEventListener('input', e => {
       const id = e.target.dataset && e.target.dataset.search;
@@ -2534,7 +3255,16 @@
     });
     $('#open-db-input').addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; if (f) openSqliteFile(f); });
     window.addEventListener('hashchange', () => { closeDrawer(); render(); window.scrollTo(0, 0); });
-    window.addEventListener('beforeunload', e => { if (state.mode === 'normal' && state.dirty && !state.persistOk) { e.preventDefault(); e.returnValue = ''; } });
+    window.addEventListener('beforeunload', e => { if (state.mode === 'normal' && state.dirty && (state.master || !state.persistOk)) { e.preventDefault(); e.returnValue = ''; } });
+    // Coming back to the tab: look for a newer master (only if permission is already granted).
+    let lastCheck = 0;
+    const recheck = () => {
+      if (document.visibilityState !== 'visible' || !state.master || !state.master.ready || Date.now() - lastCheck < 15000) return;
+      lastCheck = Date.now();
+      checkMaster({ auto: true });
+    };
+    window.addEventListener('focus', recheck);
+    document.addEventListener('visibilitychange', recheck);
   }
 
   /* ------------------------------------------------------------------ *
@@ -2567,8 +3297,15 @@
     }
     let local = null;
     try { local = await idbGet('working'); } catch (e) { state.persistOk = false; }
+    if (fsSupported) {
+      try {
+        const mm = await idbGet('master');
+        if (mm && mm.handle) state.master = { handle: mm.handle, name: mm.name, hash: mm.hash, syncedAt: mm.syncedAt, ready: false };
+      } catch (_) { /* no remembered master */ }
+    }
     const repo = await fetchRepoDb();
     const repoHash = repo ? hashBytes(repo) : null;
+    state.repoAvailable = !!repo;
     if (local && local.bytes && isSqlite(local.bytes)) {
       openDb(local.bytes);
       state.source = 'browser';
@@ -2586,9 +3323,11 @@
     const s = ensureSchema();
     if (s.foreign) { openDb(null); ensureSchema(); toast('The saved database was not in the expected format, so an empty one was started.', { err: true }); }
     state.schemaNewer = s.newer ? s.version : null;
+    schemaNotice(s);
     state.currentBytes = exportBytes();
     await persistNow();
     render();
+    if (state.master) await checkMaster({ auto: true }); // loads it if Chrome kept permission, otherwise shows "Open latest"
   }
 
   // For tests and for poking at the database from the browser console.

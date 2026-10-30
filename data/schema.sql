@@ -1,5 +1,5 @@
 -- =====================================================================
---  NMR Relaxation Database  ·  schema version 1
+--  NMR Relaxation Database  ·  schema version 3
 -- =====================================================================
 --  Units (stored values are always in these units):
 --    T1, T2, correlation times ........ s
@@ -18,6 +18,14 @@
 --  compound B and x_a = 1. A record that names B but has x_a = 0 or 1
 --  (an endpoint of a mole-fraction sweep) is also treated as pure.
 --
+--  Compounds are identified by CAS number (1st), SMILES (2nd) and name
+--  (3rd). Each is optional, but every compound needs at least one, and each
+--  is unique. Views show a compound by its name, else its CAS, else SMILES.
+--  other_names holds alternative names (separated by semicolons) that imports
+--  recognise like the name, e.g. after two duplicate compounds are merged.
+--  Version 2 made the name optional; version 3 (this file) added other_names.
+--  The web app upgrades older databases automatically.
+--
 --  NOTE: SQLite enforces foreign keys only after  PRAGMA foreign_keys = ON;
 --  which must be run on every new connection.
 -- =====================================================================
@@ -32,10 +40,11 @@ CREATE TABLE IF NOT EXISTS meta (
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS compounds (
   compound_id    INTEGER PRIMARY KEY,
-  name           TEXT NOT NULL UNIQUE COLLATE NOCASE CHECK (trim(name) <> ''),
-  cas            TEXT UNIQUE,
+  cas            TEXT UNIQUE CHECK (cas IS NULL OR trim(cas) <> ''),            -- identifier 1
+  smiles         TEXT CHECK (smiles IS NULL OR trim(smiles) <> ''),            -- identifier 2 (unique: trigger below)
+  name           TEXT UNIQUE COLLATE NOCASE CHECK (name IS NULL OR trim(name) <> ''),  -- identifier 3
+  other_names    TEXT,   -- alternative names, separated by semicolons; imports match them like the name
   formula        TEXT,
-  smiles         TEXT,
   mw_g_mol       REAL CHECK (mw_g_mol IS NULL OR mw_g_mol > 0),
   density_g_cm3  REAL CHECK (density_g_cm3 IS NULL OR density_g_cm3 > 0),
   hsp_d_mpa05    REAL,   -- Hansen dispersion parameter, delta_D
@@ -44,7 +53,8 @@ CREATE TABLE IF NOT EXISTS compounds (
   source         TEXT,   -- where the constants came from
   comments       TEXT,
   created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-  updated_at     TEXT
+  updated_at     TEXT,
+  CHECK (cas IS NOT NULL OR smiles IS NOT NULL OR name IS NOT NULL)
 );
 
 -- ---------------------------------------------------------------------
@@ -161,6 +171,7 @@ CREATE INDEX IF NOT EXISTS idx_proc_sim   ON processed_results(simulation_id);
 CREATE INDEX IF NOT EXISTS idx_proc_qty   ON processed_results(quantity);
 CREATE INDEX IF NOT EXISTS idx_raw_exp    ON raw_data(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_raw_sim    ON raw_data(simulation_id);
+CREATE INDEX IF NOT EXISTS idx_cmp_smiles ON compounds(smiles);
 
 -- ---------------------------------------------------------------------
 --  TRIGGERS: integrity rules that CHECK constraints cannot express
@@ -196,6 +207,25 @@ BEGIN
   SELECT RAISE(ABORT, 'Processed results of this simulation refer to a compound you are removing; edit them first');
 END;
 
+-- SMILES are unique like CAS numbers and names. A trigger rather than a
+-- UNIQUE constraint, so upgrading an older file never fails on duplicates
+-- already in it; new duplicates are refused, while compounds that already share
+-- a SMILES can still be edited. Exact text (SMILES is case-sensitive).
+CREATE TRIGGER IF NOT EXISTS compounds_smiles_unique_ins
+BEFORE INSERT ON compounds
+WHEN NEW.smiles IS NOT NULL AND EXISTS (SELECT 1 FROM compounds WHERE smiles = NEW.smiles)
+BEGIN
+  SELECT RAISE(ABORT, 'Another compound already has this SMILES');
+END;
+
+CREATE TRIGGER IF NOT EXISTS compounds_smiles_unique_upd
+BEFORE UPDATE OF smiles ON compounds
+WHEN NEW.smiles IS NOT NULL AND NEW.smiles IS NOT OLD.smiles AND EXISTS (
+  SELECT 1 FROM compounds WHERE smiles = NEW.smiles AND compound_id <> NEW.compound_id)
+BEGIN
+  SELECT RAISE(ABORT, 'Another compound already has this SMILES');
+END;
+
 CREATE TRIGGER IF NOT EXISTS compounds_touch AFTER UPDATE ON compounds
 WHEN NEW.updated_at IS OLD.updated_at
 BEGIN UPDATE compounds SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE compound_id = NEW.compound_id; END;
@@ -221,10 +251,11 @@ BEGIN UPDATE raw_data SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHER
 -- ---------------------------------------------------------------------
 
 -- Compounds plus derived constants.
+--   label         name, else CAS, else SMILES (how compounds are shown)
 --   molar volume  V_m = M / rho                       (cm^3/mol)
 --   Hansen total  delta_t = sqrt(dD^2 + dP^2 + dH^2)   (MPa^0.5)
 CREATE VIEW IF NOT EXISTS v_compounds AS
-SELECT c.*,
+SELECT coalesce(c.name, c.cas, c.smiles) AS label, c.*,
   CASE WHEN c.mw_g_mol IS NOT NULL AND c.density_g_cm3 IS NOT NULL
        THEN c.mw_g_mol / c.density_g_cm3 END AS molar_volume_cm3_mol,
   CASE WHEN c.hsp_d_mpa05 IS NOT NULL AND c.hsp_p_mpa05 IS NOT NULL AND c.hsp_h_mpa05 IS NOT NULL
@@ -236,13 +267,14 @@ FROM compounds c;
 CREATE VIEW IF NOT EXISTS v_experiments AS
 SELECT e.experiment_id,
   CASE WHEN e.compound_b_id IS NULL OR e.x_a >= 1 - 1e-9 OR e.x_a <= 1e-9 THEN 'pure' ELSE 'mixture' END AS sample_type,
-  ca.name AS compound_a, cb.name AS compound_b, e.x_a,
+  coalesce(ca.name, ca.cas, ca.smiles) AS compound_a, coalesce(cb.name, cb.cas, cb.smiles) AS compound_b, e.x_a,
   CASE WHEN e.compound_b_id IS NULL THEN NULL ELSE round(1.0 - e.x_a, 10) END AS x_b,
   e.temperature_k, e.magnet, e.pulse_sequence, e.echo_times_s, e.degassed, e.n_scans,
   e.t2_s, e.t2_err_s, e.diffusion_m2_s, e.diffusion_err_m2_s,
   e.location, e.date, e.user_name, e.comments,
   (SELECT count(*) FROM raw_data r WHERE r.experiment_id = e.experiment_id) AS n_raw_files,
-  e.compound_a_id, e.compound_b_id, e.created_at, e.updated_at
+  e.compound_a_id, e.compound_b_id, e.created_at, e.updated_at,
+  ca.cas AS cas_a, cb.cas AS cas_b
 FROM experiments e
 JOIN compounds ca ON ca.compound_id = e.compound_a_id
 LEFT JOIN compounds cb ON cb.compound_id = e.compound_b_id;
@@ -252,7 +284,7 @@ LEFT JOIN compounds cb ON cb.compound_id = e.compound_b_id;
 CREATE VIEW IF NOT EXISTS v_simulations AS
 SELECT s.simulation_id,
   CASE WHEN s.compound_b_id IS NULL OR s.x_a >= 1 - 1e-9 OR s.x_a <= 1e-9 THEN 'pure' ELSE 'mixture' END AS sample_type,
-  ca.name AS compound_a, cb.name AS compound_b, s.x_a,
+  coalesce(ca.name, ca.cas, ca.smiles) AS compound_a, coalesce(cb.name, cb.cas, cb.smiles) AS compound_b, s.x_a,
   CASE WHEN s.compound_b_id IS NULL THEN NULL ELSE round(1.0 - s.x_a, 10) END AS x_b,
   s.temperature_k, s.n_molecules_a, s.n_molecules_b, s.force_field, s.software,
   s.production_ns, s.timestep_fs,
@@ -267,7 +299,8 @@ SELECT s.simulation_id,
   (SELECT count(*) FROM processed_results pr WHERE pr.simulation_id = s.simulation_id) AS n_results,
   (SELECT count(*) FROM raw_data r WHERE r.simulation_id = s.simulation_id) AS n_raw_files,
   s.location, s.date, s.user_name, s.comments,
-  s.compound_a_id, s.compound_b_id, s.created_at, s.updated_at
+  s.compound_a_id, s.compound_b_id, s.created_at, s.updated_at,
+  ca.cas AS cas_a, cb.cas AS cas_b
 FROM simulations s
 JOIN compounds ca ON ca.compound_id = s.compound_a_id
 LEFT JOIN compounds cb ON cb.compound_id = s.compound_b_id;
@@ -276,7 +309,7 @@ LEFT JOIN compounds cb ON cb.compound_id = s.compound_b_id;
 CREATE VIEW IF NOT EXISTS v_processed AS
 SELECT pr.result_id, pr.simulation_id, vs.sample_type,
   vs.compound_a, vs.compound_b, vs.x_a, vs.temperature_k,
-  pr.quantity, coalesce(sp.name, 'whole sample') AS species, pr.contribution, pr.method,
+  pr.quantity, coalesce(sp.name, sp.cas, sp.smiles, 'whole sample') AS species, pr.contribution, pr.method,
   pr.value, pr.uncertainty, q.unit,
   pr.script, pr.source_path, pr.date, pr.comments,
   pr.species_compound_id, pr.created_at, pr.updated_at
@@ -324,7 +357,7 @@ WITH samples AS (
   SELECT compound_a_id, compound_b_id, x_a FROM simulations
    WHERE compound_b_id IS NOT NULL AND x_a > 1e-9 AND x_a < 1 - 1e-9
 ), vol AS (
-  SELECT s.a, s.b, s.x, ca.name AS na, cb.name AS nb,
+  SELECT s.a, s.b, s.x, coalesce(ca.name, ca.cas, ca.smiles) AS na, coalesce(cb.name, cb.cas, cb.smiles) AS nb,
          ca.mw_g_mol / ca.density_g_cm3 AS va, cb.mw_g_mol / cb.density_g_cm3 AS vb,
          ca.hsp_d_mpa05 AS da, ca.hsp_p_mpa05 AS pa, ca.hsp_h_mpa05 AS ha,
          cb.hsp_d_mpa05 AS db, cb.hsp_p_mpa05 AS pb, cb.hsp_h_mpa05 AS hb
@@ -394,7 +427,7 @@ WITH tol AS (
 SELECT
   CASE WHEN sv.q IS NULL THEN 'pure' ELSE 'mixture' END AS sample_type,
   sv.quantity, qu.unit,
-  cp.name AS compound_1, cq.name AS compound_2, round(sv.xp, 10) AS x_1,
+  coalesce(cp.name, cp.cas, cp.smiles) AS compound_1, coalesce(cq.name, cq.cas, cq.smiles) AS compound_2, round(sv.xp, 10) AS x_1,
   round(ev.xp, 10) AS x_1_exp,
   sv.t AS temperature_sim_k, ev.t AS temperature_exp_k,
   sv.method AS sim_method,
@@ -418,7 +451,7 @@ WHERE abs(sv.xp - ev.xp) <= tol.tx
   AND sv.t IS NOT NULL AND ev.t IS NOT NULL AND abs(sv.t - ev.t) <= tol.tt;
 
 INSERT OR IGNORE INTO meta (key, value) VALUES
-  ('schema_version', '1'),
+  ('schema_version', '3'),
   ('created_at', strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   ('match_tol_x', '0.01'),
   ('match_tol_t_k', '1.0');

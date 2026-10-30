@@ -23,11 +23,8 @@ opens in Python, R or DB Browser for SQLite.
 
 **Privacy.** GitHub Pages sites are public on the internet, even when the
 repository is private, unless the repository belongs to an organization on
-GitHub Enterprise Cloud. On GitHub Free, Pages only works from public
-repositories, so everything committed is public twice over. If the data should
-stay private until publication, publish only the site and keep
-`database.sqlite` somewhere private (lab drive, private repo, OneDrive); people
-then use **Open a .sqlite file…** on the Export page to load it. Opening a local file never uploads it.
+GitHub Enterprise Cloud. The site itself holds no data, so that's fine. Keep
+the database in the lab's shared folder (below), not in the repository.
 
 ### Run it without GitHub
 
@@ -44,23 +41,59 @@ then use **Open a .sqlite file…** on the Export page to load it. Opening a loc
 
 | Place | What it is | Who sees it |
 |---|---|---|
+| **`master.sqlite` in the lab's shared folder** | The shared master copy | Whoever the folder is shared with |
 | **This browser** (IndexedDB) | Your working copy, saved after every change | Only you, in this browser |
-| **`database.sqlite` you download** | A snapshot of the whole database | Whoever you give it to |
-| **`data/database.sqlite` in the repo** | The shared copy everyone starts from | Everyone who opens the site |
+| **A `.sqlite` you download** | A snapshot of the whole database | Whoever you give it to |
 
-To share changes: **Download .sqlite**, replace `data/database.sqlite` in the
-repository with it (GitHub's *Add file → Upload files* works), and commit.
-When someone opens the site and the repository file is newer than what their
-browser started from, they get a notice offering to load it.
+### Set up the master file (once)
 
-**Limits to know about**
+1. Pick a folder the lab already shares through OneDrive, Google Drive or
+   Box, and make sure it syncs to your computer (the desktop sync app).
+2. Open the site in **Chrome or Edge**, go to **Export**, and click
+   **Create master file…**. Save it into that folder as `master.sqlite`. This
+   starts the master from whatever is in your browser.
+3. Everyone else: **Export → Open master file…** and pick `master.sqlite` in
+   their synced copy of the folder.
 
-* Two people editing at the same time each have their own working copy. The
-  last file committed wins; nothing merges automatically. Agree on who
-  commits, or move rows between copies with CSV export and import.
-* Clearing browser data deletes the working copy. Download often; the status
-  line at the top says when you have changes that haven't been downloaded.
+### Day to day
+
+* Open the site. If the browser asks, click **Open latest** (or choose
+  "Allow on every visit" in Chrome's prompt so it loads automatically).
+* Edit as usual, then click **Save to master** (or press Ctrl+S). The status
+  line at the top says when you have changes that aren't saved to it.
+* The sync app uploads the file; labmates get your changes the next time they
+  open the site or switch back to its tab.
+
+### When two people edit at once
+
+The site remembers a fingerprint (SHA-256) of the master each time it loads or
+saves it. If someone else saved in between, **Save to master** stops and
+offers to download your version and load theirs, or to overwrite theirs. It
+never overwrites silently. Nothing merges automatically: to combine both sets
+of changes, re-enter yours, or export them as CSV from your downloaded copy and
+import that into the master (the importer skips rows that already exist).
+If a bad save ever slips through, roll back from the drive's version history:
+OneDrive and Google Drive keep earlier versions for about 30 days, and Box
+keeps a number of versions that depends on the plan.
+
+### Other browsers
+
+Saving straight to a file uses the File System Access API, which Chrome and
+Edge support but Firefox and Safari don't (Brave only behind a flag). In those
+browsers: **Export → Open a .sqlite file…** to load `master.sqlite`, edit,
+then **Download .sqlite** and replace `master.sqlite` in the shared folder
+with it, keeping the name.
+
+**Also good to know**
+
+* The browser shows the file's name but never its folder, and it only gets
+  access to the one file you pick.
+* Clearing browser data removes the working copy and the remembered link; the
+  master file isn't affected. Link it again with **Open master file…**.
 * Undo keeps the last 30 changes while the tab is open.
+* The old route still works if you ever want a public copy: a
+  `data/database.sqlite` committed to the repository is offered to visitors
+  who aren't linked to a master.
 
 ---
 
@@ -83,7 +116,7 @@ unit per column; forms and imports convert from other units on the way in.
 
 | Table | Section in the app | One row is… |
 |---|---|---|
-| `compounds` | Physical constants | a pure compound: name, CAS, formula, SMILES, molar mass, density, δD, δP, δH, source |
+| `compounds` | Physical constants | a pure compound: CAS, SMILES, name, other names, formula, molar mass, density, δD, δP, δH, source |
 | `experiments` | Experimental | one NMR measurement: sample, temperature, degassed, magnet, pulse sequence, echo times, scans, T₂ ± error, D ± error, location, date, user, comments |
 | `simulations` | Simulated | one MD run: sample, temperature, molecule counts, force field, software, length, timestep, location, date, user, comments |
 | `processed_results` | Processed data | one number an analysis script computed for a simulation: quantity, species, contribution, method, value ± uncertainty, script, source file |
@@ -95,13 +128,65 @@ unit per column; forms and imports convert from other units on the way in.
 
 | View | What it adds |
 |---|---|
-| `v_compounds` | molar volume V = M/ρ and total Hansen parameter δt = √(δD² + δP² + δH²) |
-| `v_experiments`, `v_simulations` | compound names, `sample_type` (pure / mixture), x_B; simulations also summarise whole-sample total T₂ and D |
+| `v_compounds` | `label` (see below), molar volume V = M/ρ and total Hansen parameter δt = √(δD² + δP² + δH²) |
+| `v_experiments`, `v_simulations` | compound labels and CAS numbers (`compound_a`, `cas_a`, …), `sample_type` (pure / mixture), x_B; simulations also summarise whole-sample total T₂ and D |
 | `v_processed` | processed results with their simulation's sample and the quantity's unit |
 | `v_raw_data` | raw-data paths with the linked record's sample |
 | `v_all_records` | experiments and simulations in one list with a `kind` column (experimental / simulated) |
 | `v_mixture_hsp` | blend Hansen parameters of every mixture in the data |
 | `v_sim_vs_exp` | simulated and measured T₂ and D paired automatically, with ratio, % difference and z-score |
+
+### How compounds are identified
+
+A compound is identified by its **CAS number first, SMILES second and name
+third**. It needs at least one of the three, the others are optional, and
+each one is unique across the table:
+
+| Identifier | Unique how | Notes |
+|---|---|---|
+| CAS number | exact; forms and imports store it without spaces or leading zeros, so `0064-17-5` is saved as `64-17-5` | checked against its check digit when typed in a form |
+| SMILES | exact text (SMILES is case-sensitive) | enforced by a trigger, not a `UNIQUE` constraint, so upgrading an older file that already repeats a SMILES doesn't fail; new repeats are refused |
+| Name | ignoring upper/lower case of A–Z (SQLite's `NOCASE`) | optional since version 2 |
+
+A compound can also have **other names** (`other_names`, separated by
+semicolons, since version 3). They aren't shown as its label, but imports and
+compound lookups recognise them like the name, and no other name can be
+another compound's name. Merging duplicates fills them in automatically.
+
+Wherever the app or a view shows a compound it uses its **label**: the name
+if there is one, otherwise the CAS number, otherwise the SMILES
+(`coalesce(name, cas, smiles)` in SQL).
+
+### Merging duplicate compounds
+
+Two rows for the same chemical (`butan-2-one` and `Methyl Ethyl Ketone
+(MEK)`, say) split its data: experiments point at one, Hansen parameters sit
+on the other. **Physical constants → Find duplicates** lists likely pairs, and
+**Merge with another compound…** in any compound's panel merges any two.
+
+**What the finder looks for.** Compounds that share a SMILES, and names (or
+other names) that match once upper/lower case, punctuation, a leading `n-` and
+a bracketed abbreviation at the end are ignored, so `1-4-dioxane` pairs with
+`1,4-Dioxane` and `Tetrahydrofuran (THF)` with `tetrahydrofuran`. It can't
+recognise synonyms written with different words (`2-butanone` and
+`methyl ethyl ketone`, `isopropanol` and `2-propanol`); merge those by hand.
+
+**What a merge does**, as one step that Undo reverses:
+
+1. Every experiment, simulation and processed result that uses the compound
+   being merged in is moved to the one you keep.
+2. The merged-in compound is deleted.
+3. The kept compound's blank values are filled from it. Where both have a
+   different value, the kept one's stays unless you pick the other; for
+   Source and Comments both are kept by default.
+4. The name that isn't kept, and both compounds' other names, become other
+   names of the kept compound, so later imports that use them still land on
+   it.
+
+**When a merge is refused:** the two have different CAS numbers (different
+compounds by definition; correct the wrong one first), or an experiment or
+simulation is a mixture of exactly these two, which would become a mixture of
+a compound with itself.
 
 ### How "processed data" is organised
 
@@ -150,6 +235,12 @@ to `schema.sql` (see *Changing the schema* below).
     are read as month/day/year.
 11. **Unit conversions** round to 12 significant figures to remove
     floating-point noise (e.g. 25 °C → 298.15 K exactly).
+12. **One CAS number, one compound.** Two rows with different CAS numbers are
+    different compounds even if their SMILES or names match, and a row's CAS
+    outranks its SMILES and name whenever they disagree.
+13. **Names and SMILES are compared as text.** The app doesn't know chemistry:
+    `2-butanone` and `butan-2-one`, or `C1COCCO1` and `O1CCOCC1`, are different
+    text, so they only end up as one compound if a CAS number links them.
 
 ---
 
@@ -157,9 +248,10 @@ to `schema.sql` (see *Changing the schema* below).
 
 **Import** accepts `.csv`, `.tsv`, `.json`, `.xlsx`, a `.sqlite` file (replaces
 the database) and the app's own JSON backup (restores it). Nothing is written
-until you confirm, the whole file goes in as one transaction, and a file with
-any invalid row imports nothing until it's fixed (the preview lists each
-problem with its spreadsheet row number).
+until you confirm, and the whole file goes in as one transaction. The preview
+lists each problem with its spreadsheet row number. By default a file with any
+problem row imports nothing; tick **Skip rows with problems and import the
+rest** to import the good rows (each skipped row is undone completely).
 
 * **Column names are matched automatically**, including the names in the
   original field list ("Mol fraction", "Echo times", "# Scans", "Locations to
@@ -168,8 +260,49 @@ problem with its spreadsheet row number).
 * **Units in headers are converted**: `T2 (ms)`, `Temp [°C]`, `D (cm^2/s)`,
   `D (nm^2/ns)`, `D (Å^2/ps)`, `D (1e-9 m^2/s)`, `t2_ms`. You can override the
   unit for each column.
-* **Compounds** are found by name or CAS number; missing ones can be created
-  automatically.
+* **Compounds are recognised by CAS number, then SMILES, then name**, using
+  whichever of those three columns you map. The highest-ranked one that finds
+  a compound decides. This applies when importing compounds and wherever an
+  experiment, simulation or result names a compound.
+  * **A matching CAS number wins even if the names differ.** The database's
+    name is kept, and the preview lists the differences under *Names kept*
+    (for example `heptane → n-Heptane`).
+  * **Rows without a CAS number or SMILES are matched by name** (as are rows
+    whose CAS and SMILES find nothing), ignoring upper/lower case, and then by
+    other names. For that the Name column has to be mapped. If it's set to
+    *ignore*, rows with only a name have nothing to be recognised by and are
+    listed as problems.
+  * **An import never renames a compound or changes a stored CAS number.** It
+    fills a blank name, a blank CAS number, and a blank or different SMILES as
+    long as no other compound already has that SMILES. An *Other names* column
+    adds to a compound's other names and never removes any.
+  * **Several rows for one compound are combined.** The first row that
+    matches a compound updates it; later rows only fill what the earlier rows
+    left blank. Where they disagree, the earlier row's value stays and the
+    preview lists the difference under *Conflicts*.
+  * **Values that already match aren't rewritten.** The preview counts those
+    compounds under *Up to date*, so re-importing a file you exported shows
+    exactly what, if anything, would change.
+  * **Contradictions stop the row.** If the CAS stored for the compound that a
+    row's SMILES or name points to differs from the row's own CAS, the row is
+    listed as a problem and isn't imported.
+  * **Lower-ranked disagreements are warnings.** If a row's CAS matches one
+    compound but its name or SMILES belongs to another, the row updates the
+    CAS match and the preview lists it under *Check matches* as a possible
+    duplicate.
+  * CAS numbers are compared after trimming spaces and leading zeros, and the
+    preview flags any whose check digit is wrong. SMILES are compared as exact
+    text, so they match when both sides come from the same source, such as
+    PubChem. If two compounds already share a SMILES (possible only in a file
+    upgraded from version 1), a row found by that SMILES needs a CAS number or
+    a matching name to say which one it means; otherwise it's a problem row.
+  * Two settings control compound imports. **Already in the database:** leave
+    unchanged, or update with the file's filled-in cells (blank cells never
+    erase anything). **Not in the database:** add them, add them with the name
+    left blank when there's a CAS number or SMILES, or skip them.
+  * Experiment, simulation and result imports can create missing compounds
+    automatically. A value that looks like a CAS number or SMILES is stored as
+    one, anything else as a name.
 * **Results from your scripts** can be long (columns `quantity`, `value`,
   `contribution`, `species`, `method`, optional `unit`) or wide (one row per
   simulation with columns like `T2_intra`, `T2_inter`, `T2_total`,
@@ -209,15 +342,39 @@ that file is opened or committed.
 
 ---
 
+## Schema versions and upgrades
+
+The schema version is stored in the `meta` table and shown on the Export page.
+When the site opens a file made with an older version, it upgrades the copy in
+your browser. The file itself (including `master.sqlite`) changes the next time
+someone saves to it, so it's fine if labmates open it in the meantime. If an
+upgrade fails, nothing in the database is changed and the site says why.
+
+**Version 1 → 2** (CAS, SMILES and name as identifiers). SQLite can't make a
+column optional in place, so the `compounds` table is rebuilt: the rows are
+copied with the same `compound_id`s, which keeps every experiment, simulation
+and result linked to the same compound, and the links are checked before the
+upgrade is kept. Blank CAS, SMILES and name cells become empty (NULL). Two
+compounds that already share a SMILES are left as they are; they still work
+and can be edited, and the importer points them out as possible duplicates.
+JSON backups made with version 1 restore into the current version the same
+way.
+
+**Version 2 → 3** (other names). Adds the empty `other_names` column to
+`compounds`; every row and id stays as it is. In an upgraded file the column
+sits at the end of the table rather than after `name`, which only affects
+`SELECT *` column order.
+
 ## Changing the schema
 
 1. Edit `schema.sql`.
 2. Run `python tools/build_schema_js.py` to regenerate `lib/schema.js`
    (the site embeds the schema so it also works when opened from disk).
-3. Existing databases are not migrated automatically: the schema only creates
-   what's missing in a new, empty database. For an existing file, run the
-   matching `ALTER TABLE` / `CREATE VIEW` statements in the SQL console, then
-   download and commit it.
+3. `schema.sql` only creates what's missing, so it doesn't change tables in an
+   existing file. Either raise `SCHEMA_VERSION` in `app.js` and add a step to
+   `MIGRATIONS` there (every copy of the site then upgrades files as it opens
+   them), or for a one-off change run the `ALTER TABLE` / `CREATE VIEW`
+   statements in the SQL console and save.
 
 ---
 
@@ -225,12 +382,12 @@ that file is opened or committed.
 
 ```
 index.html        page shell
-styles.css        styles (light and dark)
+styles.css        styles
 app.js            the app: database layer, sections, forms, import, SQL console
 schema.sql        tables, views, constraints (source of truth)
 lib/schema.js     schema.sql embedded as JavaScript (generated)
 lib/              sql.js 1.14.2 (SQLite 3.49.1), Papa Parse 5.7.0, read-excel-file 9.3.12
-data/             put database.sqlite here to share it through the site
+data/             leave empty (optional public copy, see data/README.md)
 tools/            build_schema_js.py
 ```
 
